@@ -20,12 +20,13 @@ Following the header, each record contains a **Name and Tag**:
 
 Defines the actual geometry.
 
-- **Header**: Contains bounding sphere data (radius and center), a flag, a `skeleton_id`, and the `vertex_count`.
+- **Header** (32 bytes): Contains bounding sphere data (radius and center), a flag, a `skeleton_id`, a padding field, and the `vertex_count`.
 - **Vertex Data**: An interleaved array of vertices. The stride is variable to support skinning:
   - **Standard (32 bytes)**: `Position (3f)`, `Normal (3f)`, `UV (2f)`.
   - **Skinned (48-64 bytes)**: Includes additional `blend_weight` and `bone_index` data.
 - **Trailer**: Located at the end of the vertex data, it contains:
-  - `Primitive Type` (e.g., `1` for triangle strips).
+  - `Primitive Type` (e.g., `1` for triangle strips, `4` for triangle lists).
+  - A flag.
   - `Index Count`.
   - **Indices**: An array of 16-bit unsigned integers.
 

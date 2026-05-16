@@ -72,7 +72,7 @@ fn decrypt(init: std.process.Init, args: []const [:0]const u8) !void {
         const file_content = try std.Io.Dir.cwd().readFileAlloc(init.io, input_path, init.gpa, .unlimited);
         defer init.gpa.free(file_content);
 
-        kats_tools.kats_tools_decrypt(std.mem.readInt(u32, meta.xor_key[0..4], .little), file_content.ptr, file_content.len);
+        kats_tools.kats_decrypt(std.mem.readInt(u32, meta.xor_key[0..4], .little), file_content.ptr, file_content.len);
 
         const out_path = try std.fs.path.join(init.gpa, &.{ out_dir, meta.sub_path });
         defer init.gpa.free(out_path);
@@ -107,11 +107,11 @@ fn convert(init: std.process.Init, args: []const [:0]const u8) !void {
         const file_content = try std.Io.Dir.cwd().readFileAlloc(init.io, input_path, init.gpa, .unlimited);
         defer init.gpa.free(file_content);
 
-        kats_tools.kats_tools_decrypt(std.mem.readInt(u32, meta.xor_key[0..4], .little), file_content.ptr, file_content.len);
+        kats_tools.kats_decrypt(std.mem.readInt(u32, meta.xor_key[0..4], .little), file_content.ptr, file_content.len);
 
         switch (meta.ty) {
             .clipper => {
-                const bmp_files = kats_tools.kats_tools_clipper_count_files(file_content.ptr, file_content.len);
+                const bmp_files = kats_tools.kats_clipper_count_files(file_content.ptr, file_content.len);
 
                 std.debug.print("BMP files: {d}\n", .{bmp_files});
 
@@ -130,7 +130,7 @@ fn convert(init: std.process.Init, args: []const [:0]const u8) !void {
 
                     var wav_data: []const u8 = &.{};
 
-                    if (!kats_tools.kats_tools_clipper_get(file_content.ptr, file_content.len, i, &wav_data.ptr, &wav_data.len)) {
+                    if (!kats_tools.kats_clipper_get(file_content.ptr, file_content.len, i, &wav_data.ptr, &wav_data.len)) {
                         std.debug.print("BMP file {d} not found in {s}\n", .{ i, input_path });
                         ok = false;
 
@@ -141,8 +141,180 @@ fn convert(init: std.process.Init, args: []const [:0]const u8) !void {
                     try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = out_path, .data = wav_data, .flags = .{} });
                 }
             },
+            .model => {
+                const model_records = kats_tools.kats_model_count_records(file_content.ptr, file_content.len);
+
+                std.debug.print("Model records: {d}\n", .{model_records});
+
+                if (model_records == 0) {
+                    std.debug.print("Bad model file: {s}\n", .{input_path});
+                    ok = false;
+
+                    continue;
+                }
+
+                var mesh_idx: usize = 0;
+
+                for (0..model_records) |i| {
+                    var record: kats_tools.Record = undefined;
+
+                    if (!kats_tools.kats_model_get_record(file_content.ptr, file_content.len, i, &record)) {
+                        std.debug.print("Failed to parse model record {d} in {s}\n", .{ i, input_path });
+                        ok = false;
+
+                        continue;
+                    }
+
+                    if (record.ty != .mesh_shape) {
+                        continue;
+                    }
+
+                    var mesh_header: kats_tools.MeshShapeHeader = undefined;
+
+                    if (!kats_tools.kats_model_get_mesh_shape_header(&record, &mesh_header)) {
+                        std.debug.print("Bad mesh shape header for record {d} ({s}) in {s}\n", .{ i, record.name, input_path });
+                        ok = false;
+
+                        continue;
+                    }
+
+                    var stride: u32 = undefined;
+
+                    if (!kats_tools.kats_model_guess_mesh_shape_stride(&record, &mesh_header, &stride)) {
+                        std.debug.print("Failed to detect stride for mesh {d} ({s}) in {s}\n", .{ i, record.name, input_path });
+                        ok = false;
+
+                        continue;
+                    }
+
+                    var trailer: kats_tools.ModelShapeTrailer = undefined;
+
+                    if (!kats_tools.kats_model_get_mesh_shape_trailer(&record, &mesh_header, stride, &trailer)) {
+                        std.debug.print("Failed to get trailer for mesh {d} ({s}) in {s}\n", .{ i, record.name, input_path });
+                        ok = false;
+
+                        continue;
+                    }
+
+                    const tri_list_count = kats_tools.kats_model_mesh_shape_triangle_list_index_count(&trailer);
+
+                    if (tri_list_count == 0) {
+                        mesh_idx += 1;
+
+                        continue;
+                    }
+
+                    const tri_indices = try init.gpa.alloc(u16, tri_list_count);
+                    defer init.gpa.free(tri_indices);
+
+                    if (!kats_tools.kats_model_mesh_shape_to_triangle_list(&trailer, tri_indices.ptr, tri_indices.len)) {
+                        std.debug.print("Failed to convert indices for mesh {d} {s} in {s}\n", .{ i, record.name, input_path });
+                        ok = false;
+
+                        continue;
+                    }
+
+                    var obj_writer: std.Io.Writer.Allocating = .init(init.gpa);
+                    defer obj_writer.deinit();
+
+                    const mesh_name = std.mem.span(record.name);
+
+                    try obj_writer.writer.print("# {s}\n", .{mesh_name});
+                    try obj_writer.writer.print("# stride: {d}, vertices: {d}, triangles: {d}\n\n", .{ stride, mesh_header.vertex_count, tri_list_count / 3 });
+
+                    const vertex_count: usize = mesh_header.vertex_count;
+                    const has_uv = stride >= 32;
+
+                    // Write vertex positions (v)
+                    for (0..vertex_count) |v| {
+                        var pos: [3]f32 = undefined;
+                        var norm: [3]f32 = undefined;
+                        var uv: [2]f32 = undefined;
+
+                        if (!kats_tools.kats_model_get_mesh_shape_vertex(&record, &mesh_header, stride, @intCast(v), &pos, &norm, &uv)) {
+                            pos = .{ 0, 0, 0 };
+                        }
+
+                        try obj_writer.writer.print("v {d:.6} {d:.6} {d:.6}\n", .{ pos[0], pos[1], pos[2] });
+                    }
+
+                    try obj_writer.writer.writeByte('\n');
+
+                    // Write vertex normals (vn)
+                    for (0..vertex_count) |v| {
+                        var pos: [3]f32 = undefined;
+                        var norm: [3]f32 = undefined;
+                        var uv: [2]f32 = undefined;
+
+                        if (!kats_tools.kats_model_get_mesh_shape_vertex(&record, &mesh_header, stride, @intCast(v), &pos, &norm, &uv)) {
+                            norm = .{ 0, 1, 0 };
+                        }
+
+                        try obj_writer.writer.print("vn {d:.6} {d:.6} {d:.6}\n", .{ norm[0], norm[1], norm[2] });
+                    }
+
+                    try obj_writer.writer.writeByte('\n');
+
+                    // Write texture coordinates (vt)
+                    if (has_uv) {
+                        for (0..vertex_count) |v| {
+                            var pos: [3]f32 = undefined;
+                            var norm: [3]f32 = undefined;
+                            var uv: [2]f32 = undefined;
+
+                            if (!kats_tools.kats_model_get_mesh_shape_vertex(&record, &mesh_header, stride, @intCast(v), &pos, &norm, &uv)) {
+                                uv = .{ 0, 0 };
+                            }
+
+                            try obj_writer.writer.print("vt {d:.6} {d:.6}\n", .{ uv[0], uv[1] });
+                        }
+
+                        try obj_writer.writer.writeByte('\n');
+                    }
+
+                    // Write faces (f)
+                    var tri_idx: usize = 0;
+
+                    while (tri_idx < tri_list_count) : (tri_idx += 3) {
+                        // OBJ indices are 1-based
+                        const ind_0 = @as(usize, tri_indices[tri_idx]) + 1;
+                        const ind_1 = @as(usize, tri_indices[tri_idx + 1]) + 1;
+                        const ind_2 = @as(usize, tri_indices[tri_idx + 2]) + 1;
+
+                        if (has_uv) {
+                            // Format: f v/vt/vn
+                            try obj_writer.writer.print("f {d}/{d}/{d} {d}/{d}/{d} {d}/{d}/{d}\n", .{
+                                ind_0, ind_0, ind_0,
+                                ind_1, ind_1, ind_1,
+                                ind_2, ind_2, ind_2,
+                            });
+                        } else {
+                            // Format: f v//vn
+                            try obj_writer.writer.print("f {d}//{d} {d}//{d} {d}//{d}\n", .{
+                                ind_0, ind_0,
+                                ind_1, ind_1,
+                                ind_2, ind_2,
+                            });
+                        }
+                    }
+
+                    const out_path = try std.fmt.allocPrint(init.gpa, "{f}/{s}.obj", .{ std.fs.path.fmtJoin(&.{ out_dir, withoutExt(meta.sub_path) }), record.name });
+                    defer init.gpa.free(out_path);
+
+                    std.debug.print("{s} -> {s}\n", .{ meta.sub_path, out_path });
+
+                    try std.Io.Dir.cwd().createDirPath(init.io, std.fs.path.dirname(out_path).?);
+                    try std.Io.Dir.cwd().writeFile(init.io, .{
+                        .sub_path = out_path,
+                        .data = obj_writer.written(),
+                        .flags = .{},
+                    });
+
+                    mesh_idx += 1;
+                }
+            },
             .texture => {
-                const tga_files = kats_tools.kats_tools_texture_count_files(file_content.ptr, file_content.len);
+                const tga_files = kats_tools.kats_texture_count_files(file_content.ptr, file_content.len);
 
                 std.debug.print("TGA files: {d}\n", .{tga_files});
 
@@ -161,7 +333,7 @@ fn convert(init: std.process.Init, args: []const [:0]const u8) !void {
 
                     var tga_data: []const u8 = &.{};
 
-                    if (!kats_tools.kats_tools_texture_get(file_content.ptr, file_content.len, i, &tga_data.ptr, &tga_data.len)) {
+                    if (!kats_tools.kats_texture_get(file_content.ptr, file_content.len, i, &tga_data.ptr, &tga_data.len)) {
                         std.debug.print("TGA file {d} not found in {s}\n", .{ i, input_path });
                         ok = false;
 
@@ -173,7 +345,7 @@ fn convert(init: std.process.Init, args: []const [:0]const u8) !void {
                 }
             },
             .sound => {
-                const wave_files = kats_tools.kats_tools_sound_count_files(file_content.ptr, file_content.len);
+                const wave_files = kats_tools.kats_sound_count_files(file_content.ptr, file_content.len);
 
                 std.debug.print("WAV files: {d}\n", .{wave_files});
 
@@ -192,7 +364,7 @@ fn convert(init: std.process.Init, args: []const [:0]const u8) !void {
 
                     var wav_data: []const u8 = &.{};
 
-                    if (!kats_tools.kats_tools_sound_get(file_content.ptr, file_content.len, i, &wav_data.ptr, &wav_data.len)) {
+                    if (!kats_tools.kats_sound_get(file_content.ptr, file_content.len, i, &wav_data.ptr, &wav_data.len)) {
                         std.debug.print("WAV file {d} not found in {s}\n", .{ i, input_path });
                         ok = false;
 
