@@ -7,5 +7,10 @@ A collection of tools and a C API for parsing and extracting assets from _Kasuga
 - [Sound Formats](docs/sound.md)
 - [Clipper Formats](docs/clipper.md)
 - [Texture Formats](docs/texture.md)
-- [Models](docs/model.md) (Work in progress)
-- [Animations](docs/animation.md) (Work in progress)
+- [Models](docs/model.md)
+- [Animations](docs/animation.md)
+
+## Extraction Notes
+
+- **3D Models**: The CLI tool exports only the mesh geometry to `.obj` (and `.mtl` where possible). All other metadata (skinning, material properties, transforms, etc.) is exported to a `.json` file located next to the `.obj`.
+- **Animations**: There is currently no built-in support for exporting them.

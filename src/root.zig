@@ -542,3 +542,728 @@ pub export fn kats_model_mesh_shape_to_triangle_list(trailer: *const ModelShapeT
 
     return true;
 }
+
+const NameTagResult = struct {
+    name: [*:0]const u8,
+    end_offset: usize,
+};
+
+fn readNameTagInPayload(payload: [*]const u8, payload_len: usize, offset: usize) ?NameTagResult {
+    if (offset >= payload_len) {
+        return null;
+    }
+
+    const bytes = payload[0..payload_len];
+
+    var null_pos: usize = offset;
+
+    while (null_pos < payload_len and bytes[null_pos] != 0) : (null_pos += 1) {}
+
+    if (null_pos >= payload_len) {
+        return null;
+    }
+
+    const name: [*:0]const u8 = @ptrCast(payload + offset);
+
+    var pos: usize = null_pos + 1;
+
+    while (pos < payload_len and bytes[pos] >= 0x30 and bytes[pos] <= 0x39) : (pos += 1) {}
+
+    return .{
+        .name = name,
+        .end_offset = pos,
+    };
+}
+
+pub export fn kats_model_get_vertex_format(stride: u32, out_has_color: *bool, out_has_skin: *bool, out_num_weights: *u32) callconv(.c) void {
+    out_has_color.* = false;
+    out_has_skin.* = false;
+    out_num_weights.* = 0;
+
+    switch (stride) {
+        32 => {},
+        48 => {
+            out_has_color.* = true;
+        },
+        56 => {
+            out_has_skin.* = true;
+            out_num_weights.* = 2;
+        },
+        60 => {
+            out_has_skin.* = true;
+            out_num_weights.* = 3;
+        },
+        64 => {
+            out_has_skin.* = true;
+            out_num_weights.* = 4;
+        },
+        else => {},
+    }
+}
+
+pub const MeshShapeVertexFull = extern struct {
+    position: [3]f32,
+    normal: [3]f32,
+    uv: [2]f32,
+    diffuse: [4]f32,
+    weights: [4]f32,
+    bone_indices: [4]f32,
+    has_color: bool,
+    has_skin: bool,
+    num_weights: u32,
+};
+
+pub export fn kats_model_get_mesh_shape_vertex_full(record: *const Record, header: *const MeshShapeHeader, stride: u32, vertex_idx: u32, out: *MeshShapeVertexFull) callconv(.c) bool {
+    if (vertex_idx >= header.vertex_count) {
+        return false;
+    }
+
+    const vtx_offset: usize = @sizeOf(MeshShapeHeader) + @as(usize, vertex_idx) * stride;
+
+    if (vtx_offset + stride > record.data_len) {
+        return false;
+    }
+
+    out.* = std.mem.zeroes(MeshShapeVertexFull);
+
+    var has_color: bool = undefined;
+    var has_skin: bool = undefined;
+    var num_weights: u32 = undefined;
+
+    kats_model_get_vertex_format(stride, &has_color, &has_skin, &num_weights);
+
+    out.has_color = has_color;
+    out.has_skin = has_skin;
+    out.num_weights = num_weights;
+
+    const vtx = record.data[vtx_offset..record.data_len];
+
+    // Position: offset 0
+    out.position[0] = @bitCast(std.mem.readInt(u32, vtx[0..4], .little));
+    out.position[1] = @bitCast(std.mem.readInt(u32, vtx[4..8], .little));
+    out.position[2] = @bitCast(std.mem.readInt(u32, vtx[8..12], .little));
+
+    // Normal: offset 12
+    out.normal[0] = @bitCast(std.mem.readInt(u32, vtx[12..16], .little));
+    out.normal[1] = @bitCast(std.mem.readInt(u32, vtx[16..20], .little));
+    out.normal[2] = @bitCast(std.mem.readInt(u32, vtx[20..24], .little));
+
+    // UV: offset (stride - 8)
+    if (stride >= 32) {
+        const uv_off: usize = stride - 8;
+
+        out.uv[0] = @bitCast(std.mem.readInt(u32, vtx[uv_off .. uv_off + 4][0..4], .little));
+        out.uv[1] = @bitCast(std.mem.readInt(u32, vtx[uv_off + 4 .. uv_off + 8][0..4], .little));
+    }
+
+    if (has_color) {
+        out.diffuse[0] = @bitCast(std.mem.readInt(u32, vtx[24..28], .little));
+        out.diffuse[1] = @bitCast(std.mem.readInt(u32, vtx[28..32], .little));
+        out.diffuse[2] = @bitCast(std.mem.readInt(u32, vtx[32..36], .little));
+        out.diffuse[3] = @bitCast(std.mem.readInt(u32, vtx[36..40], .little));
+    }
+
+    if (has_skin) {
+        var raw_weights = [4]f32{ 0.0, 0.0, 0.0, 0.0 };
+
+        for (0..num_weights) |w_idx| {
+            const w_off: usize = 24 + w_idx * 4;
+
+            raw_weights[w_idx] = @bitCast(std.mem.readInt(u32, vtx[w_off .. w_off + 4][0..4], .little));
+        }
+
+        if (num_weights == 2) {
+            raw_weights[2] = 0.0;
+            raw_weights[3] = 0.0;
+        } else if (num_weights == 3) {
+            const sum3 = raw_weights[0] + raw_weights[1] + raw_weights[2];
+
+            raw_weights[3] = if (sum3 < 1.0) 1.0 - sum3 else 0.0;
+        }
+
+        const wsum = raw_weights[0] + raw_weights[1] + raw_weights[2] + raw_weights[3];
+
+        if (wsum > 0.0001) {
+            out.weights[0] = raw_weights[0] / wsum;
+            out.weights[1] = raw_weights[1] / wsum;
+            out.weights[2] = raw_weights[2] / wsum;
+            out.weights[3] = raw_weights[3] / wsum;
+        } else {
+            out.weights = .{ 1.0, 0.0, 0.0, 0.0 };
+        }
+
+        const bi_off: usize = 24 + @as(usize, num_weights) * 4;
+
+        out.bone_indices[0] = @bitCast(std.mem.readInt(u32, vtx[bi_off .. bi_off + 4][0..4], .little));
+        out.bone_indices[1] = @bitCast(std.mem.readInt(u32, vtx[bi_off + 4 .. bi_off + 8][0..4], .little));
+        out.bone_indices[2] = @bitCast(std.mem.readInt(u32, vtx[bi_off + 8 .. bi_off + 12][0..4], .little));
+        out.bone_indices[3] = @bitCast(std.mem.readInt(u32, vtx[bi_off + 12 .. bi_off + 16][0..4], .little));
+    }
+
+    return true;
+}
+
+pub const Material = extern struct {
+    sub_count: u32,
+    texture_name: [*:0]const u8,
+    diffuse: [4]f32,
+    ambient: [4]f32,
+    specular: [4]f32,
+    emissive: [4]f32,
+    power: f32,
+    has_d3d_material: bool,
+    _bone_refs_offset: usize,
+};
+
+pub export fn kats_model_get_material(record: *const Record, out: *Material) callconv(.c) bool {
+    if (record.ty != .material) {
+        return false;
+    }
+
+    if (record.data_len < 4) {
+        return false;
+    }
+
+    out.* = std.mem.zeroes(Material);
+
+    out.sub_count = std.mem.readInt(u32, record.data[0..4], .little);
+
+    const nt = readNameTagInPayload(record.data, record.data_len, 4) orelse {
+        out.texture_name = @ptrCast(@alignCast(&empty_string));
+        out._bone_refs_offset = 4;
+
+        return true;
+    };
+
+    out.texture_name = nt.name;
+
+    var pp: usize = nt.end_offset;
+
+    if (pp + 68 <= record.data_len) {
+        out.has_d3d_material = true;
+
+        for (0..4) |comp| {
+            out.diffuse[comp] = @bitCast(std.mem.readInt(u32, record.data[pp + comp * 4 .. pp + comp * 4 + 4][0..4], .little));
+            out.ambient[comp] = @bitCast(std.mem.readInt(u32, record.data[pp + 16 + comp * 4 .. pp + 16 + comp * 4 + 4][0..4], .little));
+            out.specular[comp] = @bitCast(std.mem.readInt(u32, record.data[pp + 32 + comp * 4 .. pp + 32 + comp * 4 + 4][0..4], .little));
+            out.emissive[comp] = @bitCast(std.mem.readInt(u32, record.data[pp + 48 + comp * 4 .. pp + 48 + comp * 4 + 4][0..4], .little));
+        }
+
+        out.power = @bitCast(std.mem.readInt(u32, record.data[pp + 64 .. pp + 68][0..4], .little));
+        pp += 68;
+    }
+
+    out._bone_refs_offset = pp;
+
+    return true;
+}
+
+const empty_string: [1]u8 = .{0};
+
+pub export fn kats_model_get_material_bone_ref_count(record: *const Record, material: *const Material) callconv(.c) usize {
+    var offset: usize = material._bone_refs_offset;
+    var count: usize = 0;
+
+    while (count < material.sub_count and count < 30) {
+        const nt = readNameTagInPayload(record.data, record.data_len, offset) orelse {
+            break;
+        };
+
+        count += 1;
+        offset = nt.end_offset;
+    }
+
+    return count;
+}
+
+pub export fn kats_model_get_material_bone_ref(record: *const Record, material: *const Material, idx: usize, out_name: *[*:0]const u8) callconv(.c) bool {
+    var offset: usize = material._bone_refs_offset;
+    var count: usize = 0;
+
+    while (count <= idx and count < material.sub_count and count < 30) {
+        const nt = readNameTagInPayload(record.data, record.data_len, offset) orelse {
+            return false;
+        };
+
+        if (count == idx) {
+            out_name.* = nt.name;
+
+            return true;
+        }
+
+        count += 1;
+        offset = nt.end_offset;
+    }
+
+    return false;
+}
+
+pub const ShapeRefHeader = extern struct {
+    ref_count: u32,
+};
+
+pub export fn kats_model_get_shape_ref_header(record: *const Record, out: *ShapeRefHeader) callconv(.c) bool {
+    if (record.ty != .shape_ref) {
+        return false;
+    }
+
+    if (record.data_len < 4) {
+        return false;
+    }
+
+    out.ref_count = std.mem.readInt(u32, record.data[0..4], .little);
+
+    return true;
+}
+
+pub export fn kats_model_get_shape_ref_binding(record: *const Record, idx: usize, out_material_name: *[*:0]const u8, out_shape_name: *[*:0]const u8) callconv(.c) bool {
+    if (record.ty != .shape_ref) {
+        return false;
+    }
+
+    if (record.data_len < 4) {
+        return false;
+    }
+
+    const ref_count = std.mem.readInt(u32, record.data[0..4], .little);
+
+    if (idx >= ref_count) {
+        return false;
+    }
+
+    var offset: usize = 4;
+    var count: usize = 0;
+
+    while (count <= idx) {
+        const mat_nt = readNameTagInPayload(record.data, record.data_len, offset) orelse {
+            return false;
+        };
+
+        const shape_nt = readNameTagInPayload(record.data, record.data_len, mat_nt.end_offset) orelse {
+            return false;
+        };
+
+        if (count == idx) {
+            out_material_name.* = mat_nt.name;
+            out_shape_name.* = shape_nt.name;
+
+            return true;
+        }
+
+        count += 1;
+        offset = shape_nt.end_offset;
+    }
+
+    return false;
+}
+
+pub const TextureRef = extern struct {
+    texture_set_name: [*:0]const u8,
+    texture_file: [*:0]const u8,
+    tex_params: [6]u32,
+    has_params: bool,
+};
+
+pub export fn kats_model_get_texture_ref(record: *const Record, out: *TextureRef) callconv(.c) bool {
+    if (record.ty != .texture_ref) {
+        return false;
+    }
+
+    out.* = std.mem.zeroes(TextureRef);
+    out.texture_set_name = record.name;
+
+    const file_nt = readNameTagInPayload(record.data, record.data_len, 0) orelse {
+        out.texture_file = @ptrCast(@alignCast(&empty_string));
+
+        return true;
+    };
+
+    out.texture_file = file_nt.name;
+
+    if (file_nt.end_offset + 24 <= record.data_len) {
+        for (0..6) |param_idx| {
+            const p_off = file_nt.end_offset + param_idx * 4;
+
+            out.tex_params[param_idx] = std.mem.readInt(u32, record.data[p_off .. p_off + 4][0..4], .little);
+        }
+
+        out.has_params = true;
+    }
+
+    return true;
+}
+
+pub const TransformNode = extern struct {
+    flag: u32,
+    translation: [3]f32,
+    rotation: [3]f32,
+    scale: [3]f32,
+};
+
+pub export fn kats_model_get_transform_node(record: *const Record, out: *TransformNode) callconv(.c) bool {
+    if (record.ty != .transform_node) {
+        return false;
+    }
+
+    if (record.data_len < 40) {
+        return false;
+    }
+
+    out.flag = std.mem.readInt(u32, record.data[0..4], .little);
+
+    for (0..3) |comp| {
+        out.translation[comp] = @bitCast(std.mem.readInt(u32, record.data[4 + comp * 4 .. 8 + comp * 4][0..4], .little));
+        out.rotation[comp] = @bitCast(std.mem.readInt(u32, record.data[16 + comp * 4 .. 20 + comp * 4][0..4], .little));
+        out.scale[comp] = @bitCast(std.mem.readInt(u32, record.data[28 + comp * 4 .. 32 + comp * 4][0..4], .little));
+    }
+
+    return true;
+}
+
+pub const SkeletonRoot = extern struct {
+    val1: u32,
+    val2: u32,
+    skeleton_shape_ref: [*:0]const u8,
+};
+
+pub export fn kats_model_get_skeleton_root(record: *const Record, out: *SkeletonRoot) callconv(.c) bool {
+    if (record.ty != .skeleton_root) {
+        return false;
+    }
+
+    if (record.data_len < 8) {
+        return false;
+    }
+
+    out.val1 = std.mem.readInt(u32, record.data[0..4], .little);
+    out.val2 = std.mem.readInt(u32, record.data[4..8], .little);
+
+    const shape_nt = readNameTagInPayload(record.data, record.data_len, 8) orelse {
+        out.skeleton_shape_ref = @ptrCast(@alignCast(&empty_string));
+
+        return true;
+    };
+
+    out.skeleton_shape_ref = shape_nt.name;
+
+    return true;
+}
+
+pub const Joint = extern struct {
+    flag: u32,
+    translation: [3]f32,
+    rotation: [3]f32,
+    scale: [3]f32,
+    inv_bind_matrix_3x4: [12]f32,
+    has_inv_bind_matrix: bool,
+    extra_data: [*]const u8,
+    extra_data_len: usize,
+};
+
+pub export fn kats_model_get_joint(record: *const Record, out: *Joint) callconv(.c) bool {
+    if (record.ty != .joint) {
+        return false;
+    }
+
+    if (record.data_len < 40) {
+        return false;
+    }
+
+    out.* = std.mem.zeroes(Joint);
+
+    out.flag = std.mem.readInt(u32, record.data[0..4], .little);
+
+    for (0..3) |comp| {
+        out.translation[comp] = @bitCast(std.mem.readInt(u32, record.data[4 + comp * 4 .. 8 + comp * 4][0..4], .little));
+        out.rotation[comp] = @bitCast(std.mem.readInt(u32, record.data[16 + comp * 4 .. 20 + comp * 4][0..4], .little));
+        out.scale[comp] = @bitCast(std.mem.readInt(u32, record.data[28 + comp * 4 .. 32 + comp * 4][0..4], .little));
+    }
+
+    if (record.data_len >= 88) {
+        out.has_inv_bind_matrix = true;
+
+        for (0..12) |mat_idx| {
+            const m_off: usize = 40 + mat_idx * 4;
+
+            out.inv_bind_matrix_3x4[mat_idx] = @bitCast(std.mem.readInt(u32, record.data[m_off .. m_off + 4][0..4], .little));
+        }
+
+        if (record.data_len > 88) {
+            out.extra_data = record.data + 88;
+            out.extra_data_len = record.data_len - 88;
+        }
+    }
+
+    return true;
+}
+
+pub const KeyframeChannel = extern struct {
+    target_node: [*]const u8,
+    target_node_len: usize,
+    channel_type: [*]const u8,
+    channel_type_len: usize,
+    flag: u32,
+    kf_count: u32,
+    keyframes: [*]const f32,
+};
+
+pub export fn kats_model_get_keyframe_channel(record: *const Record, out: *KeyframeChannel) callconv(.c) bool {
+    if (record.ty != .keyframe_channel) {
+        return false;
+    }
+
+    if (record.data_len < 8) {
+        return false;
+    }
+
+    out.* = std.mem.zeroes(KeyframeChannel);
+
+    // record.name is the full channel name: {target_node}_{channel_type}
+    // rsplit on last '_' to separate target_node and channel_type
+    const full_name = std.mem.span(record.name);
+    const name_len = full_name.len;
+
+    var last_underscore: usize = name_len;
+    {
+        var pos: usize = name_len;
+        while (pos > 0) : (pos -= 1) {
+            if (full_name[pos - 1] == '_') {
+                last_underscore = pos - 1;
+
+                break;
+            }
+        }
+    }
+
+    if (last_underscore < name_len) {
+        out.target_node = record.name;
+        out.target_node_len = last_underscore;
+        out.channel_type = record.name + last_underscore + 1;
+        out.channel_type_len = name_len - last_underscore - 1;
+    } else {
+        out.target_node = record.name;
+        out.target_node_len = name_len;
+        out.channel_type = record.name + name_len;
+        out.channel_type_len = 0;
+    }
+
+    // Validate channel type
+    const VALID_TYPES = [_][]const u8{ "tx", "ty", "tz", "rx", "ry", "rz", "sx", "sy", "sz" };
+    const ch_type_slice = out.channel_type[0..out.channel_type_len];
+
+    var valid = false;
+
+    for (VALID_TYPES) |vt| {
+        if (std.mem.eql(u8, ch_type_slice, vt)) {
+            valid = true;
+
+            break;
+        }
+    }
+
+    if (!valid) {
+        return false;
+    }
+
+    out.flag = std.mem.readInt(u32, record.data[0..4], .little);
+    out.kf_count = std.mem.readInt(u32, record.data[4..8], .little);
+
+    if (out.kf_count > 100_000) {
+        return false;
+    }
+
+    const kf_data_size: usize = @as(usize, out.kf_count) * 8;
+
+    if (8 + kf_data_size > record.data_len) {
+        return false;
+    }
+
+    out.keyframes = @ptrCast(@alignCast(record.data + 8));
+
+    return true;
+}
+
+pub const AnimSet = extern struct {
+    channel_count: u32,
+};
+
+pub export fn kats_model_get_anim_set(record: *const Record, out: *AnimSet) callconv(.c) bool {
+    if (record.ty != .anim_set) {
+        return false;
+    }
+
+    if (record.data_len < 4) {
+        return false;
+    }
+
+    out.channel_count = std.mem.readInt(u32, record.data[0..4], .little);
+
+    return true;
+}
+
+const JointParentRule = struct {
+    pattern: []const u8,
+    parent: ?[]const u8,
+};
+
+const JOINT_PARENT_RULES = [_]JointParentRule{
+    .{ .pattern = "koshi", .parent = null },
+    .{ .pattern = "spine1", .parent = "koshi" },
+    .{ .pattern = "spine2", .parent = "spine1" },
+    .{ .pattern = "neck", .parent = "spine2" },
+    .{ .pattern = "head", .parent = "neck" },
+    .{ .pattern = "sholderL1", .parent = "spine2" },
+    .{ .pattern = "sholderL2", .parent = "sholderL1" },
+    .{ .pattern = "udeL1", .parent = "sholderL2" },
+    .{ .pattern = "udeL2", .parent = "udeL1" },
+    .{ .pattern = "teL", .parent = "udeL2" },
+    .{ .pattern = "sholderR1", .parent = "spine2" },
+    .{ .pattern = "sholderR2", .parent = "sholderR1" },
+    .{ .pattern = "udeR1", .parent = "sholderR2" },
+    .{ .pattern = "udeR2", .parent = "udeR1" },
+    .{ .pattern = "teR", .parent = "udeR2" },
+    .{ .pattern = "momoL1", .parent = "koshi" },
+    .{ .pattern = "momoL2", .parent = "momoL1" },
+    .{ .pattern = "hizaL", .parent = "momoL2" },
+    .{ .pattern = "suneL", .parent = "hizaL" },
+    .{ .pattern = "ashiL", .parent = "suneL" },
+    .{ .pattern = "momoR1", .parent = "koshi" },
+    .{ .pattern = "momoR2", .parent = "momoR1" },
+    .{ .pattern = "hizaR", .parent = "momoR2" },
+    .{ .pattern = "suneR", .parent = "hizaR" },
+    .{ .pattern = "ashiR", .parent = "suneR" },
+    .{ .pattern = "hairBase", .parent = "head" },
+    .{ .pattern = "hairL", .parent = "hairBase" },
+    .{ .pattern = "hairR", .parent = "hairBase" },
+    .{ .pattern = "hairBack", .parent = "hairBase" },
+    .{ .pattern = "hatBase", .parent = "head" },
+};
+
+fn ciContains(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len > haystack.len) {
+        return false;
+    }
+
+    for (0..haystack.len - needle.len + 1) |start| {
+        var match = true;
+
+        for (needle, 0..) |nc, offset| {
+            var hc = haystack[start + offset];
+            var ncc = nc;
+
+            if (hc >= 'A' and hc <= 'Z') {
+                hc += 32;
+            }
+
+            if (ncc >= 'A' and ncc <= 'Z') {
+                ncc += 32;
+            }
+
+            if (hc != ncc) {
+                match = false;
+
+                break;
+            }
+        }
+
+        if (match) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+fn ciEqual(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) {
+        return false;
+    }
+
+    for (a, b) |ac, bc| {
+        var lc_a = ac;
+        var lc_b = bc;
+
+        if (lc_a >= 'A' and lc_a <= 'Z') {
+            lc_a += 32;
+        }
+
+        if (lc_b >= 'A' and lc_b <= 'Z') {
+            lc_b += 32;
+        }
+
+        if (lc_a != lc_b) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+pub export fn kats_infer_joint_parent(joint_name: [*:0]const u8, all_joint_names: [*]const [*:0]const u8, joint_count: usize, out_parent_name: *?[*:0]const u8) callconv(.c) bool {
+    const jname = std.mem.span(joint_name);
+    out_parent_name.* = null;
+
+    // Check known patterns (case-insensitive substring match)
+    for (JOINT_PARENT_RULES) |rule| {
+        if (ciContains(jname, rule.pattern)) {
+            if (rule.parent == null) {
+                // Root joint
+                return true;
+            }
+
+            // Find parent in joint list
+            for (0..joint_count) |jdx| {
+                const candidate = std.mem.span(all_joint_names[jdx]);
+
+                if (ciContains(candidate, rule.parent.?)) {
+                    out_parent_name.* = all_joint_names[jdx];
+
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Heuristic: name ends with digit N > 1 - parent is prefix + (N-1)
+    if (jname.len > 1) {
+        var digit_start = jname.len;
+
+        while (digit_start > 0 and jname[digit_start - 1] >= '0' and jname[digit_start - 1] <= '9') {
+            digit_start -= 1;
+        }
+
+        if (digit_start < jname.len and digit_start > 0) {
+            const suffix = std.fmt.parseInt(u32, jname[digit_start..], 10) catch {
+                return true;
+            };
+
+            if (suffix > 1) {
+                var buf: [256]u8 = undefined;
+                const prefix = jname[0..digit_start];
+
+                if (prefix.len + 10 > buf.len) {
+                    return true;
+                }
+
+                @memcpy(buf[0..prefix.len], prefix);
+
+                const suffix_str = std.fmt.bufPrint(buf[prefix.len..], "{d}", .{suffix - 1}) catch {
+                    return true;
+                };
+
+                const candidate = buf[0 .. prefix.len + suffix_str.len];
+
+                for (0..joint_count) |jdx| {
+                    if (ciEqual(std.mem.span(all_joint_names[jdx]), candidate)) {
+                        out_parent_name.* = all_joint_names[jdx];
+
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    // No parent found - treat as root
+    return true;
+}
