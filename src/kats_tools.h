@@ -91,7 +91,8 @@ bool kats_texture_get(const uint8_t *data, size_t data_len, size_t idx,
 // Model record type enumeration.
 //==============================================================================
 
-/// @brief TLV record types used in model .bin files.
+// TLV record types used in model .bin files.
+
 // $MODEL_RECORD_TYPES
 
 //==============================================================================
@@ -166,7 +167,8 @@ bool kats_model_get_mesh_shape_header(const kats_Record *record,
 // Primitive type enumeration.
 //==============================================================================
 
-/// @brief Primitive topology types for mesh index buffers.
+// Primitive topology types for mesh index buffers.
+
 // $PRIMITIVE_TYPES
 
 /// @brief MeshShape trailer (index buffer descriptor).
