@@ -212,6 +212,73 @@ inline fn skipToModelRecord(reader: *std.Io.Reader, idx: usize) !void {
     }
 }
 
+/// Validate a MeshShapeHeader at a given payload offset.
+/// Returns true if the header looks sane: flag==1, padding==0, vertex_count reasonable,
+/// and radius/center are finite floats.
+fn validateMeshShapeHeader(payload: [*]const u8, payload_len: usize, header_offset: usize) bool {
+    if (header_offset + @sizeOf(MeshShapeHeader) > payload_len) {
+        return false;
+    }
+
+    const p = payload + header_offset;
+
+    const radius = readF32Le(p);
+    if (!std.math.isFinite(radius)) {
+        return false;
+    }
+
+    const cx = readF32Le(p + 4);
+    const cy = readF32Le(p + 8);
+    const cz = readF32Le(p + 12);
+
+    if (!std.math.isFinite(cx) or !std.math.isFinite(cy) or !std.math.isFinite(cz)) {
+        return false;
+    }
+
+    const flag = std.mem.readInt(u32, p[16..20], .little);
+
+    if (flag != 1) {
+        return false;
+    }
+
+    const padding = std.mem.readInt(u32, p[24..28], .little);
+
+    if (padding != 0) {
+        return false;
+    }
+
+    const vertex_count = std.mem.readInt(u32, p[28..32], .little);
+
+    if (vertex_count == 0 or vertex_count > 100_000) {
+        return false;
+    }
+
+    // Position sanity check for first vertex data after header
+    const vtx_start = header_offset + @sizeOf(MeshShapeHeader);
+
+    if (vtx_start + 32 <= payload_len) {
+        const px = readF32Le(payload + vtx_start);
+        const py = readF32Le(payload + vtx_start + 4);
+        const pz = readF32Le(payload + vtx_start + 8);
+
+        if (@abs(px) > 50000 or @abs(py) > 50000 or @abs(pz) > 50000) {
+            return false;
+        }
+
+        const nx = readF32Le(payload + vtx_start + 12);
+        const ny = readF32Le(payload + vtx_start + 16);
+        const nz = readF32Le(payload + vtx_start + 20);
+
+        const nlen = @sqrt(nx * nx + ny * ny + nz * nz);
+
+        if (nlen > 0.01 and @abs(nlen - 1.0) > 0.5) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 pub export fn kats_model_get_record(data: [*]const u8, data_len: usize, idx: usize, out: *Record) callconv(.c) bool {
     var reader: std.Io.Reader = .fixed(data[0..data_len]);
 
@@ -239,19 +306,57 @@ pub export fn kats_model_get_record(data: [*]const u8, data_len: usize, idx: usi
         return false;
     }).ptr;
 
+    // Greedily count ASCII digit bytes after null terminator
     const tag = data[reader.seek..data_len];
-    var i: usize = 0;
+    var greedy_tag_len: usize = 0;
 
-    while (i < tag.len and std.ascii.isDigit(tag[i])) : (i += 1) {}
+    while (greedy_tag_len < tag.len and std.ascii.isDigit(tag[greedy_tag_len])) : (greedy_tag_len += 1) {}
+
+    // For MeshShape records, the greedy tag may have consumed bytes that are actually
+    // part of the 32-byte header (the LSB of the radius float can be in 0x30-0x39 range).
+    // Probe from shortest tag (0) to greedy length, and pick the first that yields a
+    // valid MeshShapeHeader.
+    var actual_tag_len: usize = greedy_tag_len;
+
+    if (out.ty == .mesh_shape and greedy_tag_len > 0) {
+        const payload_start = reader.seek;
+        const payload_available = out.size - (reader.seek - start_idx);
+
+        var best_tag_len: usize = greedy_tag_len;
+        var found_valid: bool = false;
+
+        // Try tag lengths from 0 up to greedy_tag_len, prefer the longest valid one
+        // that still produces a sane header. Start from greedy and work backwards
+        // to prefer the most specific tag match.
+        var probe_len = greedy_tag_len;
+
+        while (true) : (probe_len -= 1) {
+            const header_offset = probe_len;
+
+            if (validateMeshShapeHeader(data + payload_start, payload_available, header_offset)) {
+                best_tag_len = probe_len;
+                found_valid = true;
+            }
+
+            if (probe_len == 0) {
+                break;
+            }
+        }
+
+        if (found_valid) {
+            actual_tag_len = best_tag_len;
+        }
+    }
 
     out.tag = tag.ptr;
-    out.tag_len = i;
+    out.tag_len = actual_tag_len;
 
-    reader.discardAll(i) catch {
+    reader.discardAll(actual_tag_len) catch {
         return false;
     };
 
     const consumed = reader.seek - start_idx;
+
     if (consumed > out.size) {
         return false;
     }
@@ -350,77 +455,173 @@ pub export fn kats_model_get_mesh_shape_trailer(record: *const Record, header: *
     return true;
 }
 
-pub export fn kats_model_guess_mesh_shape_stride(record: *const Record, header: *const MeshShapeHeader, out: *u32) callconv(.c) bool {
-    const STRIDES = [_]u32{ 32, 48, 56, 60, 64, 36, 40, 44, 52, 24, 28 };
+/// Check whether a candidate stride yields a valid trailer and vertex data.
+fn validateStride(record: *const Record, header: *const MeshShapeHeader, stride: u32) bool {
+    if (stride == 0 or stride > 256) {
+        return false;
+    }
 
     if (header.vertex_count > 100_000) {
         return false;
     }
 
     const vtx_start: usize = @sizeOf(MeshShapeHeader);
+    const vtx_data_len: usize = @as(usize, header.vertex_count) * stride;
+    const trailer_offset: usize = vtx_start + vtx_data_len;
 
-    for (STRIDES) |stride| {
-        const vtx_data_len: usize = @as(usize, header.vertex_count) * stride;
-        const trailer_offset: usize = vtx_start + vtx_data_len;
+    // Check that there's room for the trailer header (12 bytes)
+    if (trailer_offset + 12 > record.data_len) {
+        return false;
+    }
 
-        // Check that there's room for the trailer header (12 bytes)
-        if (trailer_offset + 12 > record.data_len) {
-            continue;
+    var reader: std.Io.Reader = .fixed(record.data[trailer_offset..record.data_len]);
+
+    const t1 = reader.takeInt(u32, .little) catch return false;
+    const t2 = reader.takeInt(u32, .little) catch return false;
+    const t3 = reader.takeInt(u32, .little) catch return false;
+
+    // Validate trailer: primitive_type must be 1 (strip) or 4 (list), flag must be 1,
+    // index_count must be reasonable
+    if ((t1 != 1 and t1 != 4) or t2 != 1 or t3 == 0 or t3 > 100_000) {
+        return false;
+    }
+
+    // Check that indices fit exactly within the record
+    const idx_end: usize = trailer_offset + 12 + @as(usize, t3) * 2;
+
+    if (idx_end != record.data_len) {
+        return false;
+    }
+
+    // Validate first index is within vertex range
+    if (t3 >= 2) {
+        const first_idx = std.mem.readInt(u16, record.data[trailer_offset + 12 ..][0..2], .little);
+
+        if (first_idx > header.vertex_count) {
+            return false;
+        }
+    }
+
+    // Validate first vertex: position should be in reasonable range,
+    // normal should be approximately unit length
+    if (vtx_start + stride <= record.data_len and stride >= 24) {
+        const px = readF32Le(record.data[vtx_start..]);
+        const py = readF32Le(record.data[vtx_start + 4 ..]);
+        const pz = readF32Le(record.data[vtx_start + 8 ..]);
+
+        if (@abs(px) > 50000 or @abs(py) > 50000 or @abs(pz) > 50000) {
+            return false;
         }
 
-        var reader: std.Io.Reader = .fixed(record.data[trailer_offset..record.data_len]);
+        const nx = readF32Le(record.data[vtx_start + 12 ..]);
+        const ny = readF32Le(record.data[vtx_start + 16 ..]);
+        const nz = readF32Le(record.data[vtx_start + 20 ..]);
 
-        const t1 = reader.takeInt(u32, .little) catch return false;
-        const t2 = reader.takeInt(u32, .little) catch return false;
-        const t3 = reader.takeInt(u32, .little) catch return false;
+        const nlen = @sqrt(nx * nx + ny * ny + nz * nz);
 
-        // Validate trailer: primitive_type must be 1 (strip) or 4 (list), flag must be 1,
-        // index_count must be reasonable
-        if ((t1 != 1 and t1 != 4) or t2 != 1 or t3 == 0 or t3 > 100_000) {
-            continue;
+        if (nlen > 0.01 and @abs(nlen - 1.0) > 0.5) {
+            return false;
         }
+    }
 
-        // Check that indices fit exactly within the record
-        const idx_end: usize = trailer_offset + 12 + @as(usize, t3) * 2;
+    return true;
+}
 
-        if (idx_end != record.data_len) {
-            continue;
+pub export fn kats_model_guess_mesh_shape_stride(record: *const Record, header: *const MeshShapeHeader, out: *u32) callconv(.c) bool {
+    if (header.vertex_count == 0 or header.vertex_count > 100_000) {
+        return false;
+    }
+
+    const vtx_start: usize = @sizeOf(MeshShapeHeader);
+
+    // Strategy 1: Scan for a valid trailer by computing stride from data_len constraints.
+    // We know the record layout is: [header][vertex_data][trailer_header(12)][index_data].
+    // For each possible index_count (reading from potential trailer positions),
+    // we can compute the trailer_offset and derive the stride.
+    // trailer_offset + 12 + index_count * 2 = data_len
+    // vtx_start + vertex_count * stride = trailer_offset
+    // So: stride = (data_len - 12 - index_count * 2 - vtx_start) / vertex_count
+    //
+    // We scan possible index_counts by probing potential trailer positions.
+
+    // Scan for valid trailer at 4-byte aligned offsets after the minimum vertex data
+    {
+        const min_vertex_data: usize = @as(usize, header.vertex_count) * 24; // minimum stride = 24
+        const scan_start: usize = vtx_start + min_vertex_data;
+
+        // Try offsets in steps of vertex_count to find aligned strides
+        var offset: usize = scan_start;
+
+        while (offset + 12 <= record.data_len) {
+            const remaining: usize = record.data_len - offset - 12;
+
+            // The remaining bytes after the 12-byte trailer header must be an even number
+            // (16-bit indices) and the index_count must match
+            if (remaining % 2 == 0) {
+                const potential_index_count: u32 = @intCast(remaining / 2);
+
+                // Read potential trailer fields
+                const t1 = std.mem.readInt(u32, record.data[offset..][0..4], .little);
+                const t2 = std.mem.readInt(u32, record.data[offset + 4 ..][0..4], .little);
+                const t3 = std.mem.readInt(u32, record.data[offset + 8 ..][0..4], .little);
+
+                if ((t1 == 1 or t1 == 4) and t2 == 1 and t3 > 0 and t3 <= 100_000 and t3 == potential_index_count) {
+                    // Compute stride from this trailer position
+                    const vtx_data_len: usize = offset - vtx_start;
+
+                    if (vtx_data_len % header.vertex_count == 0) {
+                        const stride: u32 = @intCast(vtx_data_len / header.vertex_count);
+
+                        if (stride >= 24 and stride <= 256 and validateStride(record, header, stride)) {
+                            out.* = stride;
+
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // Advance by vertex_count bytes (keeps stride aligned) or by 4 if that's too large
+            const step = if (header.vertex_count <= 64) @as(usize, header.vertex_count) else 4;
+            offset += step;
         }
+    }
 
-        // Validate first index is within vertex range
-        if (t3 >= 2) {
-            const first_idx = std.mem.readInt(u16, record.data[trailer_offset + 12 ..][0..2], .little);
+    // Strategy 2: Fallback - try known stride values from the original hardcoded list.
+    // This catches edge cases where the scan-based approach misses a valid stride
+    // (e.g., when vertex_count is very large and the step size overshoots).
+    const KNOWN_STRIDES = [_]u32{ 32, 48, 56, 60, 64, 36, 40, 44, 52, 24, 28, 72, 68, 76, 80 };
 
-            if (first_idx > header.vertex_count) {
-                continue;
+    for (KNOWN_STRIDES) |stride| {
+        if (validateStride(record, header, stride)) {
+            out.* = stride;
+
+            return true;
+        }
+    }
+
+    // Strategy 3: Last resort - try every 4-byte aligned stride from 24 to 256
+    {
+        var stride: u32 = 24;
+
+        while (stride <= 256) : (stride += 4) {
+            // Skip strides already tried in KNOWN_STRIDES
+            var already_tried = false;
+
+            for (KNOWN_STRIDES) |ks| {
+                if (ks == stride) {
+                    already_tried = true;
+
+                    break;
+                }
+            }
+
+            if (!already_tried and validateStride(record, header, stride)) {
+                out.* = stride;
+
+                return true;
             }
         }
-
-        // Validate first vertex: position should be in reasonable range,
-        // normal should be approximately unit length
-        if (vtx_start + stride <= record.data_len and stride >= 32) {
-            const px = readF32Le(record.data[vtx_start..]);
-            const py = readF32Le(record.data[vtx_start + 4 ..]);
-            const pz = readF32Le(record.data[vtx_start + 8 ..]);
-
-            if (@abs(px) > 50000 or @abs(py) > 50000 or @abs(pz) > 50000) {
-                continue;
-            }
-
-            const nx = readF32Le(record.data[vtx_start + 12 ..]);
-            const ny = readF32Le(record.data[vtx_start + 16 ..]);
-            const nz = readF32Le(record.data[vtx_start + 20 ..]);
-
-            const nlen = @sqrt(nx * nx + ny * ny + nz * nz);
-
-            if (nlen > 0.01 and @abs(nlen - 1.0) > 0.5) {
-                continue;
-            }
-        }
-
-        out.* = stride;
-
-        return true;
     }
 
     return false;
@@ -548,6 +749,48 @@ const NameTagResult = struct {
     end_offset: usize,
 };
 
+/// Read a null-terminated string from a record data payload.
+/// Unlike readNameTagInPayload, this does NOT skip ASCII digit bytes after
+/// the null terminator. The "digit tag" convention is specific to the record
+/// header format (name + optional numeric tag). Within a record's data payload,
+/// strings are simply null-terminated and the byte immediately after the null
+/// belongs to the next field, not a tag.
+///
+/// Using readNameTagInPayload for data payloads was causing subtle offset bugs:
+/// if the byte after a name's null terminator happened to fall in 0x30..0x39
+/// (e.g. the LSB of a D3D material float like 0.7f -> [0x33,0x33,0x33,0x3F]),
+/// it would be consumed as a "digit tag", shifting all subsequent reads.
+fn readNullTermInPayload(payload: [*]const u8, payload_len: usize, offset: usize) ?NameTagResult {
+    if (offset >= payload_len) {
+        return null;
+    }
+
+    const bytes = payload[0..payload_len];
+
+    var null_pos: usize = offset;
+
+    while (null_pos < payload_len and bytes[null_pos] != 0) : (null_pos += 1) {}
+
+    if (null_pos >= payload_len) {
+        return null;
+    }
+
+    const name: [*:0]const u8 = @ptrCast(payload + offset);
+
+    return .{
+        .name = name,
+        .end_offset = null_pos + 1,
+    };
+}
+
+/// Read a null-terminated string followed by an optional numeric tag (ASCII
+/// digit bytes) from a record HEADER. This is the original format where the
+/// record name is followed by an optional sequence of ASCII digits used as a
+/// disambiguation tag (e.g. "mesh\0" vs "mesh\01").
+///
+/// NOTE: Do NOT use this for reading strings from record DATA payloads.
+/// Use readNullTermInPayload instead, since data payload strings do not have
+/// digit tags and the next byte after null belongs to the following field.
 fn readNameTagInPayload(payload: [*]const u8, payload_len: usize, offset: usize) ?NameTagResult {
     if (offset >= payload_len) {
         return null;
@@ -713,6 +956,7 @@ pub const Material = extern struct {
     power: f32,
     has_d3d_material: bool,
     _bone_refs_offset: usize,
+    _bone_refs_count: u32,
 };
 
 pub export fn kats_model_get_material(record: *const Record, out: *Material) callconv(.c) bool {
@@ -728,7 +972,7 @@ pub export fn kats_model_get_material(record: *const Record, out: *Material) cal
 
     out.sub_count = std.mem.readInt(u32, record.data[0..4], .little);
 
-    const nt = readNameTagInPayload(record.data, record.data_len, 4) orelse {
+    const nt = readNullTermInPayload(record.data, record.data_len, 4) orelse {
         out.texture_name = @ptrCast(@alignCast(&empty_string));
         out._bone_refs_offset = 4;
 
@@ -754,6 +998,65 @@ pub export fn kats_model_get_material(record: *const Record, out: *Material) cal
     }
 
     out._bone_refs_offset = pp;
+    out._bone_refs_count = 0;
+
+    // Try to locate the actual bone name strings.
+    // The data after the D3D material may contain a bone palette index array
+    // (sub_count * 4 bytes of u32) before the null-terminated bone names.
+    // We scan from the current offset looking for a region where we can read
+    // `sub_count` consecutive valid null-terminated ASCII strings.
+    if (out.sub_count > 0 and out.sub_count < 30) {
+        var best_offset: usize = pp;
+        var best_count: u32 = 0;
+
+        // Try offsets: current, current+4*sub_count, and a few other candidates
+        const candidates = [_]usize{
+            pp,
+            pp + @as(usize, out.sub_count) * 4,
+            pp + @as(usize, out.sub_count) * 2, // u16 indices
+            pp + 4, // single u32 count
+        };
+
+        for (candidates) |try_offset| {
+            if (try_offset >= record.data_len) continue;
+
+            var off: usize = try_offset;
+            var cnt: u32 = 0;
+
+            while (cnt < out.sub_count and cnt < 30) {
+                const br_nt = readNullTermInPayload(record.data, record.data_len, off) orelse break;
+
+                // Validate: bone name should contain only printable ASCII
+                const name_slice = std.mem.span(br_nt.name);
+                var valid = true;
+
+                for (name_slice) |b| {
+                    if (b < 0x20 or b > 0x7e) {
+                        valid = false;
+                        break;
+                    }
+                }
+
+                // Empty names are technically valid (some bones may be unnamed)
+                // but if we see non-printable chars, this offset is wrong
+                if (!valid) break;
+
+                cnt += 1;
+                off = br_nt.end_offset;
+            }
+
+            if (cnt > best_count) {
+                best_count = cnt;
+                best_offset = try_offset;
+            }
+
+            // If we got all sub_count strings, this is the right offset
+            if (cnt == out.sub_count) break;
+        }
+
+        out._bone_refs_offset = best_offset;
+        out._bone_refs_count = best_count;
+    }
 
     return true;
 }
@@ -761,13 +1064,33 @@ pub export fn kats_model_get_material(record: *const Record, out: *Material) cal
 const empty_string: [1]u8 = .{0};
 
 pub export fn kats_model_get_material_bone_ref_count(record: *const Record, material: *const Material) callconv(.c) usize {
+    // Use the pre-computed count from kats_model_get_material which already
+    // validated the bone names for printable ASCII.
+    if (material._bone_refs_count > 0) {
+        return material._bone_refs_count;
+    }
+
+    // Fallback: count valid null-terminated strings
     var offset: usize = material._bone_refs_offset;
     var count: usize = 0;
 
     while (count < material.sub_count and count < 30) {
-        const nt = readNameTagInPayload(record.data, record.data_len, offset) orelse {
+        const nt = readNullTermInPayload(record.data, record.data_len, offset) orelse {
             break;
         };
+
+        // Validate: bone name should contain only printable ASCII
+        const name_slice = std.mem.span(nt.name);
+        var valid = true;
+
+        for (name_slice) |b| {
+            if (b < 0x20 or b > 0x7e) {
+                valid = false;
+                break;
+            }
+        }
+
+        if (!valid) break;
 
         count += 1;
         offset = nt.end_offset;
@@ -781,9 +1104,22 @@ pub export fn kats_model_get_material_bone_ref(record: *const Record, material: 
     var count: usize = 0;
 
     while (count <= idx and count < material.sub_count and count < 30) {
-        const nt = readNameTagInPayload(record.data, record.data_len, offset) orelse {
+        const nt = readNullTermInPayload(record.data, record.data_len, offset) orelse {
             return false;
         };
+
+        // Validate: bone name should contain only printable ASCII
+        const name_slice = std.mem.span(nt.name);
+        var valid = true;
+
+        for (name_slice) |b| {
+            if (b < 0x20 or b > 0x7e) {
+                valid = false;
+                break;
+            }
+        }
+
+        if (!valid) return false;
 
         if (count == idx) {
             out_name.* = nt.name;
@@ -835,11 +1171,11 @@ pub export fn kats_model_get_shape_ref_binding(record: *const Record, idx: usize
     var count: usize = 0;
 
     while (count <= idx) {
-        const mat_nt = readNameTagInPayload(record.data, record.data_len, offset) orelse {
+        const mat_nt = readNullTermInPayload(record.data, record.data_len, offset) orelse {
             return false;
         };
 
-        const shape_nt = readNameTagInPayload(record.data, record.data_len, mat_nt.end_offset) orelse {
+        const shape_nt = readNullTermInPayload(record.data, record.data_len, mat_nt.end_offset) orelse {
             return false;
         };
 
@@ -872,7 +1208,7 @@ pub export fn kats_model_get_texture_ref(record: *const Record, out: *TextureRef
     out.* = std.mem.zeroes(TextureRef);
     out.texture_set_name = record.name;
 
-    const file_nt = readNameTagInPayload(record.data, record.data_len, 0) orelse {
+    const file_nt = readNullTermInPayload(record.data, record.data_len, 0) orelse {
         out.texture_file = @ptrCast(@alignCast(&empty_string));
 
         return true;
@@ -938,7 +1274,7 @@ pub export fn kats_model_get_skeleton_root(record: *const Record, out: *Skeleton
     out.val1 = std.mem.readInt(u32, record.data[0..4], .little);
     out.val2 = std.mem.readInt(u32, record.data[4..8], .little);
 
-    const shape_nt = readNameTagInPayload(record.data, record.data_len, 8) orelse {
+    const shape_nt = readNullTermInPayload(record.data, record.data_len, 8) orelse {
         out.skeleton_shape_ref = @ptrCast(@alignCast(&empty_string));
 
         return true;
@@ -1265,5 +1601,41 @@ pub export fn kats_infer_joint_parent(joint_name: [*:0]const u8, all_joint_names
     }
 
     // No parent found - treat as root
+    return true;
+}
+
+/// Animation file record types (reuse ModelRecordType since animation files
+/// use the same TLV format with types 7, 8, 9).
+pub export fn kats_animation_count_records(data: [*]const u8, data_len: usize) callconv(.c) usize {
+    return kats_model_count_records(data, data_len);
+}
+
+pub export fn kats_animation_get_record(data: [*]const u8, data_len: usize, idx: usize, out: *Record) callconv(.c) bool {
+    return kats_model_get_record(data, data_len, idx, out);
+}
+
+pub const AnimRef = extern struct {
+    anim_set_name: [*:0]const u8,
+};
+
+pub export fn kats_animation_get_anim_ref(record: *const Record, out: *AnimRef) callconv(.c) bool {
+    if (record.ty != .anim_ref) {
+        return false;
+    }
+
+    if (record.data_len < 1) {
+        return false;
+    }
+
+    // The AnimRef payload contains a null-terminated name of the AnimSet it references.
+    const nt = readNullTermInPayload(record.data, record.data_len, 0) orelse {
+        // Fallback: use the record's own name if no name found in payload
+        out.anim_set_name = record.name;
+
+        return true;
+    };
+
+    out.anim_set_name = nt.name;
+
     return true;
 }

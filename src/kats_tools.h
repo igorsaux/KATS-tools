@@ -399,6 +399,10 @@ typedef struct
     ///        Used by kats_model_get_material_bone_ref_count and
     ///        kats_model_get_material_bone_ref. Do not modify.
     size_t _bone_refs_offset;
+    /// @brief Internal: number of valid bone references found.
+    ///        Pre-computed by kats_model_get_material with ASCII validation.
+    ///        Do not modify.
+    uint32_t _bone_refs_count;
 } kats_Material;
 
 /// @brief Parses a Material record.
@@ -759,3 +763,51 @@ bool kats_infer_joint_parent(const char *joint_name,
                              const char *const *all_joint_names,
                              size_t joint_count,
                              const char **out_parent_name);
+
+//==============================================================================
+// Animation file functions.
+//==============================================================================
+
+/// @brief Counts the number of TLV records in the animation data.
+///
+/// Animation files use the same TLV format as model files.
+/// Record types found in animation files: anim_ref (7), keyframe_channel (8),
+/// anim_set (9).
+///
+/// @param data Pointer to the decrypted animation data.
+/// @param data_len Length of the data in bytes.
+/// @return Number of records found, or 0 on error.
+size_t kats_animation_count_records(const uint8_t *data, size_t data_len);
+
+/// @brief Gets a TLV record at the specified index from animation data.
+///
+/// Identical to kats_model_get_record but operates on animation file data.
+/// The returned kats_Record can be used with the same accessor functions
+/// (kats_model_get_keyframe_channel, kats_model_get_anim_set, etc.).
+///
+/// @param data Pointer to the decrypted animation data.
+/// @param data_len Length of the data in bytes.
+/// @param idx Zero-based index of the record.
+/// @param[out] out Pointer to the output record descriptor.
+/// @return true if the record was found and parsed, false otherwise.
+bool kats_animation_get_record(const uint8_t *data, size_t data_len,
+                               size_t idx, kats_Record *out);
+
+/// @brief Parsed AnimRef record (TLV type 7).
+///
+/// Links a model to an animation set by name.
+typedef struct
+{
+    /// @brief Name of the referenced AnimSet (null-terminated, within record data).
+    const char *anim_set_name;
+} kats_AnimRef;
+
+/// @brief Parses an AnimRef record.
+///
+/// Reads the referenced AnimSet name from the record payload.
+///
+/// @param record Pointer to a previously obtained record (must be of type anim_ref).
+/// @param[out] out Output anim reference descriptor.
+/// @return true on success, false if the record type is not anim_ref.
+bool kats_animation_get_anim_ref(const kats_Record *record,
+                                 kats_AnimRef *out);

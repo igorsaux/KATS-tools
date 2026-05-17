@@ -312,7 +312,7 @@ fn convertModel(init: std.process.Init, file_content: []const u8, out_dir: []con
         joint_list.items.len,
     });
 
-    // -- Build skeleton groups (joints grouped by their preceding SkeletonRoot) --
+    // Build skeleton groups (joints grouped by their preceding SkeletonRoot)
     const SkeletonGroup = struct {
         root_record: kats_tools.Record,
         joint_records: []kats_tools.Record,
@@ -327,7 +327,6 @@ fn convertModel(init: std.process.Init, file_content: []const u8, out_dir: []con
         skeleton_groups.deinit(init.gpa);
     }
 
-    // Better approach: scan records in TLV order to group joints under skeleton roots
     {
         var current_root: ?kats_tools.Record = null;
         var current_joints: std.ArrayList(kats_tools.Record) = .empty;
@@ -714,6 +713,15 @@ fn convertModel(init: std.process.Init, file_content: []const u8, out_dir: []con
                     const tex_name = std.mem.span(material.texture_name);
                     try json_writer.writer.print("\"texture_name\": \"{s}\"", .{tex_name});
 
+                    // Debug: warn if bone_refs parsing seems incorrect
+                    {
+                        const bro = material._bone_refs_offset;
+                        const remaining = if (bro < mat_record.data_len) mat_record.data_len - bro else 0;
+                        if (material.sub_count > 0 and material._bone_refs_count == 0 and remaining > 0) {
+                            std.debug.print("WARNING: material '{s}' has sub_count={d} but found 0 valid bone refs (data_len={d}, offset={d}, remaining={d})\n", .{ mat_name, material.sub_count, mat_record.data_len, bro, remaining });
+                        }
+                    }
+
                     const bone_ref_count = kats_tools.kats_model_get_material_bone_ref_count(mat_record, &material);
 
                     if (bone_ref_count > 0) {
@@ -905,6 +913,210 @@ fn convertModel(init: std.process.Init, file_content: []const u8, out_dir: []con
     }
 }
 
+fn convertAnimation(init: std.process.Init, file_content: []const u8, out_dir: []const u8, sub_path: []const u8, ok: *bool) !void {
+    const record_count = kats_tools.kats_animation_count_records(file_content.ptr, file_content.len);
+
+    std.debug.print("Animation records: {d}\n", .{record_count});
+
+    if (record_count == 0) {
+        std.debug.print("Bad animation file: {s}\n", .{sub_path});
+        ok.* = false;
+
+        return;
+    }
+
+    var json_writer: std.Io.Writer.Allocating = .init(init.gpa);
+    defer json_writer.deinit();
+
+    try json_writer.writer.writeAll("{\n");
+    try json_writer.writer.writeAll("  \"source_file\": \"");
+    try json_writer.writer.writeAll(sub_path);
+    try json_writer.writer.writeAll("\",\n");
+
+    // Collect all AnimSets and their channels
+    // AnimSet groups channels that follow it until the next AnimSet or different record type
+
+    const AnimGroup = struct {
+        set_record: kats_tools.Record,
+        channels: std.ArrayList(kats_tools.Record),
+    };
+
+    var anim_groups: std.ArrayList(AnimGroup) = .empty;
+    defer {
+        for (anim_groups.items) |*ag| {
+            ag.channels.deinit(init.gpa);
+        }
+
+        anim_groups.deinit(init.gpa);
+    }
+
+    var anim_refs: std.ArrayList(kats_tools.Record) = .empty;
+    defer anim_refs.deinit(init.gpa);
+
+    // Group channels by their preceding AnimSet
+    {
+        var current_set: ?kats_tools.Record = null;
+        var current_channels: std.ArrayList(kats_tools.Record) = .empty;
+        defer current_channels.deinit(init.gpa);
+
+        for (0..record_count) |rec_idx| {
+            var record: kats_tools.Record = undefined;
+
+            if (!kats_tools.kats_animation_get_record(file_content.ptr, file_content.len, rec_idx, &record)) {
+                continue;
+            }
+
+            if (record.ty == .anim_set) {
+                // Flush previous group
+                if (current_set != null) {
+                    const cloned_channels = try current_channels.clone(init.gpa);
+
+                    try anim_groups.append(init.gpa, .{
+                        .set_record = current_set.?,
+                        .channels = cloned_channels,
+                    });
+                }
+
+                current_set = record;
+                current_channels.clearRetainingCapacity();
+            } else if (record.ty == .keyframe_channel) {
+                if (current_set != null) {
+                    try current_channels.append(init.gpa, record);
+                } else {
+                    // Orphan channel without a preceding AnimSet - create a synthetic group
+                    var synthetic_channels: std.ArrayList(kats_tools.Record) = .empty;
+                    try synthetic_channels.append(init.gpa, record);
+
+                    try anim_groups.append(init.gpa, .{
+                        .set_record = record, // use channel as its own "set"
+                        .channels = synthetic_channels,
+                    });
+                }
+            } else if (record.ty == .anim_ref) {
+                try anim_refs.append(init.gpa, record);
+            }
+        }
+
+        // Flush last group
+        if (current_set != null) {
+            const last_cloned = try current_channels.clone(init.gpa);
+
+            try anim_groups.append(init.gpa, .{
+                .set_record = current_set.?,
+                .channels = last_cloned,
+            });
+        }
+    }
+
+    // AnimRefs
+    try json_writer.writer.writeAll("  \"anim_refs\": [\n");
+
+    for (anim_refs.items, 0..) |ref_record, ref_idx| {
+        if (ref_idx > 0) {
+            try json_writer.writer.writeAll(",\n");
+        }
+
+        var anim_ref: kats_tools.AnimRef = undefined;
+
+        if (kats_tools.kats_animation_get_anim_ref(&ref_record, &anim_ref)) {
+            const ref_name = std.mem.span(ref_record.name);
+            const set_name = std.mem.span(anim_ref.anim_set_name);
+
+            try json_writer.writer.print("    {{ \"name\": \"{s}\", \"anim_set\": \"{s}\" }}", .{ ref_name, set_name });
+        } else {
+            const ref_name = std.mem.span(ref_record.name);
+            try json_writer.writer.print("    {{ \"name\": \"{s}\" }}", .{ref_name});
+        }
+    }
+
+    try json_writer.writer.writeAll("\n  ],\n");
+
+    // AnimSets with their channels
+    try json_writer.writer.writeAll("  \"animations\": {\n");
+
+    for (anim_groups.items, 0..) |ag, group_idx| {
+        if (group_idx > 0) {
+            try json_writer.writer.writeAll(",\n");
+        }
+
+        const set_name = std.mem.span(ag.set_record.name);
+        try json_writer.writer.print("    \"{s}\": {{\n", .{set_name});
+
+        // AnimSet metadata
+        if (ag.set_record.ty == .anim_set) {
+            var anim_set: kats_tools.AnimSet = undefined;
+
+            if (kats_tools.kats_model_get_anim_set(&ag.set_record, &anim_set)) {
+                try json_writer.writer.print("      \"channel_count\": {d},\n", .{anim_set.channel_count});
+            }
+        }
+
+        try json_writer.writer.writeAll("      \"channels\": [\n");
+
+        for (ag.channels.items, 0..) |ch_record, ch_idx| {
+            if (ch_idx > 0) {
+                try json_writer.writer.writeAll(",\n");
+            }
+
+            var channel: kats_tools.KeyframeChannel = undefined;
+
+            if (!kats_tools.kats_model_get_keyframe_channel(&ch_record, &channel)) {
+                const ch_name = std.mem.span(ch_record.name);
+                try json_writer.writer.print("        {{ \"name\": \"{s}\", \"error\": true }}", .{ch_name});
+
+                continue;
+            }
+
+            const target_node = channel.target_node[0..channel.target_node_len];
+            const channel_type = channel.channel_type[0..channel.channel_type_len];
+
+            try json_writer.writer.writeAll("        {\n");
+            try json_writer.writer.print("          \"name\": \"{s}\",\n", .{std.mem.span(ch_record.name)});
+            try json_writer.writer.print("          \"target_node\": \"{s}\",\n", .{target_node});
+            try json_writer.writer.print("          \"channel_type\": \"{s}\",\n", .{channel_type});
+            try json_writer.writer.print("          \"flag\": {d},\n", .{channel.flag});
+            try json_writer.writer.print("          \"keyframe_count\": {d},\n", .{channel.kf_count});
+
+            // Keyframes: array of [time, value] pairs
+            try json_writer.writer.writeAll("          \"keyframes\": [");
+
+            for (0..channel.kf_count) |kf_idx| {
+                const time = channel.keyframes[kf_idx * 2];
+                const value = channel.keyframes[kf_idx * 2 + 1];
+
+                if (kf_idx > 0) {
+                    try json_writer.writer.writeAll(", ");
+                }
+
+                try json_writer.writer.print("[{d:.6}, {d:.6}]", .{ time, value });
+            }
+
+            try json_writer.writer.writeAll("]\n");
+            try json_writer.writer.writeAll("        }");
+        }
+
+        try json_writer.writer.writeAll("\n      ]\n");
+        try json_writer.writer.writeAll("    }");
+    }
+
+    try json_writer.writer.writeAll("\n  }\n");
+
+    try json_writer.writer.writeAll("}\n");
+
+    // Write JSON output
+    const base_dir = try std.fs.path.join(init.gpa, &.{ out_dir, withoutExt(sub_path) });
+    defer init.gpa.free(base_dir);
+
+    try std.Io.Dir.cwd().createDirPath(init.io, base_dir);
+
+    const json_path = try std.fmt.allocPrint(init.gpa, "{s}/animation.json", .{base_dir});
+    defer init.gpa.free(json_path);
+
+    std.debug.print("  {s} -> {s}\n", .{ sub_path, json_path });
+
+    try std.Io.Dir.cwd().writeFile(init.io, .{ .sub_path = json_path, .data = json_writer.written(), .flags = .{} });
+}
+
 fn convert(init: std.process.Init, args: []const [:0]const u8) !void {
     if (args.len != 4) {
         printUsage();
@@ -1017,9 +1229,7 @@ fn convert(init: std.process.Init, args: []const [:0]const u8) !void {
                 }
             },
             .animation => {
-                // Animation files are parsed but not converted to standalone output yet.
-                // Their data is referenced by model JSON files for rigging.
-                std.debug.print("Animation file: {s} (parsed via model JSON)\n", .{meta.sub_path});
+                try convertAnimation(init, file_content, out_dir, meta.sub_path, &ok);
             },
         }
     }
