@@ -125,17 +125,185 @@ pub export fn kats_clipper_get(data: [*]const u8, data_len: usize, idx: usize, o
     return true;
 }
 
+/// TGA v2 footer signature (18 bytes at the end of the file).
+const TGA_FOOTER_SIGNATURE: []const u8 = "TRUEVISION-XFILE.\x00";
+
+/// TGA v2 footer total size: 4 bytes extension area offset + 4 bytes developer
+/// directory offset + 18 bytes signature = 26 bytes.
+const TGA_FOOTER_SIZE: usize = 26;
+
+/// Read a u16 little-endian from a byte pointer.
+inline fn readU16Le(ptr: [*]const u8) u16 {
+    return std.mem.readInt(u16, ptr[0..2], .little);
+}
+
+/// Parse a TGA image starting at the given offset in the data.
+/// Returns the byte length of the complete TGA image
+/// (header + id + colormap + image data + optional TGA v2 footer),
+/// or 0 if the data at `offset` does not look like a valid TGA.
+fn parseTgaImageSize(data: [*]const u8, data_len: usize, offset: usize) usize {
+    if (offset + 18 > data_len) {
+        return 0;
+    }
+
+    // Read header fields manually to avoid alignment issues
+    const h = data + offset;
+    const id_length: u8 = h[0];
+    const color_map_type: u8 = h[1];
+    const image_type: u8 = h[2];
+    const color_map_length: u16 = readU16Le(h + 5);
+    const color_map_entry_size: u8 = h[7];
+    const width: u16 = readU16Le(h + 12);
+    const height: u16 = readU16Le(h + 14);
+    const pixel_depth: u8 = h[16];
+
+    // Validate image type: must be one of the known TGA image types
+    switch (image_type) {
+        0, 1, 2, 3, 9, 10, 11 => {},
+        else => return 0,
+    }
+
+    // Validate color map type
+    if (color_map_type > 1) {
+        return 0;
+    }
+
+    // Validate dimensions
+    if (width == 0 or height == 0 or width > 4096 or height > 4096) {
+        return 0;
+    }
+
+    // Validate pixel depth
+    switch (pixel_depth) {
+        8, 16, 24, 32 => {},
+        else => return 0,
+    }
+
+    // Calculate position after header + image ID
+    var pos: usize = offset + 18 + id_length;
+
+    // Skip color map data
+    if (color_map_type == 1) {
+        const cm_entry_bytes: usize = (@as(usize, color_map_entry_size) + 7) / 8;
+        const cm_bytes: usize = @as(usize, color_map_length) * cm_entry_bytes;
+
+        pos += cm_bytes;
+    }
+
+    if (pos > data_len) {
+        return 0;
+    }
+
+    // Calculate image data size
+    const pixel_count: usize = @as(usize, width) * @as(usize, height);
+    const bytes_per_pixel: usize = pixel_depth / 8;
+
+    switch (image_type) {
+        1, 2, 3 => {
+            // Uncompressed: exact pixel data size
+            pos += pixel_count * bytes_per_pixel;
+        },
+        9, 10, 11 => {
+            // RLE compressed: scan through RLE packets to find actual data size
+            var pixels_decoded: usize = 0;
+
+            while (pixels_decoded < pixel_count) {
+                if (pos + 1 > data_len) {
+                    return 0;
+                }
+
+                const packet_type = data[pos];
+                pos += 1;
+
+                const count: usize = (@as(usize, packet_type & 0x7F) + 1);
+
+                if (packet_type & 0x80 != 0) {
+                    // RLE packet: one pixel value repeated `count` times
+                    if (pos + bytes_per_pixel > data_len) {
+                        return 0;
+                    }
+
+                    pos += bytes_per_pixel;
+                    pixels_decoded += count;
+                } else {
+                    // Raw packet: `count` individual pixel values
+                    if (pos + count * bytes_per_pixel > data_len) {
+                        return 0;
+                    }
+
+                    pos += count * bytes_per_pixel;
+                    pixels_decoded += count;
+                }
+            }
+        },
+        else => unreachable,
+    }
+
+    if (pos > data_len) return 0;
+
+    // Check for TGA v2 footer immediately after image data.
+    // The footer is 26 bytes: 4-byte extension area offset + 4-byte developer
+    // directory offset + 18-byte signature "TRUEVISION-XFILE.\0".
+    // All footer-bearing TGAs in the game files have ext_offset=0 and
+    // dev_offset=0, so the footer is placed right after the image data.
+    if (pos + TGA_FOOTER_SIZE <= data_len) {
+        const sig_start = pos + 8; // signature starts 8 bytes into the footer
+        const sig_end = sig_start + TGA_FOOTER_SIGNATURE.len;
+
+        if (std.mem.eql(u8, data[sig_start..sig_end], TGA_FOOTER_SIGNATURE)) {
+            pos += TGA_FOOTER_SIZE;
+        }
+    }
+
+    return pos - offset;
+}
+
 pub export fn kats_texture_count_files(data: [*]const u8, data_len: usize) callconv(.c) usize {
-    return countSignatures(data[0..data_len], "TRUEVISION-XFILE.\x00");
+    var count: usize = 0;
+    var offset: usize = 0;
+
+    while (offset < data_len) {
+        const tga_size = parseTgaImageSize(data, data_len, offset);
+
+        if (tga_size == 0) {
+            // Could not parse a valid TGA at this position; skip forward
+            // and try to find the next valid TGA header. This handles edge
+            // cases where there might be alignment padding or garbage bytes.
+            offset += 1;
+            continue;
+        }
+
+        count += 1;
+        offset += tga_size;
+    }
+
+    return count;
 }
 
 pub export fn kats_texture_get(data: [*]const u8, data_len: usize, idx: usize, out: *[*]const u8, out_len: *usize) callconv(.c) bool {
-    const slice = getSignatureSlice(data[0..data_len], "TRUEVISION-XFILE.\x00", .footer, idx) orelse return false;
+    var current_idx: usize = 0;
+    var offset: usize = 0;
 
-    out.* = slice.ptr;
-    out_len.* = slice.len;
+    while (offset < data_len) {
+        const tga_size = parseTgaImageSize(data, data_len, offset);
 
-    return true;
+        if (tga_size == 0) {
+            offset += 1;
+            continue;
+        }
+
+        if (current_idx == idx) {
+            out.* = data + offset;
+            out_len.* = tga_size;
+
+            return true;
+        }
+
+        current_idx += 1;
+        offset += tga_size;
+    }
+
+    return false;
 }
 
 pub const ModelRecordType = enum(c_int) {
@@ -476,9 +644,17 @@ fn validateStride(record: *const Record, header: *const MeshShapeHeader, stride:
 
     var reader: std.Io.Reader = .fixed(record.data[trailer_offset..record.data_len]);
 
-    const t1 = reader.takeInt(u32, .little) catch return false;
-    const t2 = reader.takeInt(u32, .little) catch return false;
-    const t3 = reader.takeInt(u32, .little) catch return false;
+    const t1 = reader.takeInt(u32, .little) catch {
+        return false;
+    };
+
+    const t2 = reader.takeInt(u32, .little) catch {
+        return false;
+    };
+
+    const t3 = reader.takeInt(u32, .little) catch {
+        return false;
+    };
 
     // Validate trailer: primitive_type must be 1 (strip) or 4 (list), flag must be 1,
     // index_count must be reasonable
@@ -695,6 +871,7 @@ pub export fn kats_model_mesh_shape_to_triangle_list(trailer: *const ModelShapeT
 
         // Reverse winding for each triangle (ind_2, ind_1, ind_0) to invert normals
         var tri: usize = 0;
+
         while (tri + 3 <= trailer.index_count) : (tri += 3) {
             out_indices[tri] = trailer.indexes[tri + 2];
             out_indices[tri + 1] = trailer.indexes[tri + 1];
@@ -1024,7 +1201,9 @@ pub export fn kats_model_get_material(record: *const Record, out: *Material) cal
             var cnt: u32 = 0;
 
             while (cnt < out.sub_count and cnt < 30) {
-                const br_nt = readNullTermInPayload(record.data, record.data_len, off) orelse break;
+                const br_nt = readNullTermInPayload(record.data, record.data_len, off) orelse {
+                    break;
+                };
 
                 // Validate: bone name should contain only printable ASCII
                 const name_slice = std.mem.span(br_nt.name);
@@ -1033,13 +1212,16 @@ pub export fn kats_model_get_material(record: *const Record, out: *Material) cal
                 for (name_slice) |b| {
                     if (b < 0x20 or b > 0x7e) {
                         valid = false;
+
                         break;
                     }
                 }
 
                 // Empty names are technically valid (some bones may be unnamed)
                 // but if we see non-printable chars, this offset is wrong
-                if (!valid) break;
+                if (!valid) {
+                    break;
+                }
 
                 cnt += 1;
                 off = br_nt.end_offset;
@@ -1051,7 +1233,9 @@ pub export fn kats_model_get_material(record: *const Record, out: *Material) cal
             }
 
             // If we got all sub_count strings, this is the right offset
-            if (cnt == out.sub_count) break;
+            if (cnt == out.sub_count) {
+                break;
+            }
         }
 
         out._bone_refs_offset = best_offset;
@@ -1086,11 +1270,14 @@ pub export fn kats_model_get_material_bone_ref_count(record: *const Record, mate
         for (name_slice) |b| {
             if (b < 0x20 or b > 0x7e) {
                 valid = false;
+
                 break;
             }
         }
 
-        if (!valid) break;
+        if (!valid) {
+            break;
+        }
 
         count += 1;
         offset = nt.end_offset;
@@ -1115,11 +1302,14 @@ pub export fn kats_model_get_material_bone_ref(record: *const Record, material: 
         for (name_slice) |b| {
             if (b < 0x20 or b > 0x7e) {
                 valid = false;
+
                 break;
             }
         }
 
-        if (!valid) return false;
+        if (!valid) {
+            return false;
+        }
 
         if (count == idx) {
             out_name.* = nt.name;

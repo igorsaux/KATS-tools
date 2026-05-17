@@ -574,6 +574,7 @@ fn convertModel(init: std.process.Init, file_content: []const u8, out_dir: []con
                     });
                 }
             }
+
             try obj_writer.writer.writeByte('\n');
 
             global_vtx_offset += vertex_count;
@@ -1120,6 +1121,7 @@ fn convertAnimation(init: std.process.Init, file_content: []const u8, out_dir: [
 fn convert(init: std.process.Init, args: []const [:0]const u8) !void {
     if (args.len != 4) {
         printUsage();
+
         return error.BadArgs;
     }
 
@@ -1146,6 +1148,7 @@ fn convert(init: std.process.Init, args: []const [:0]const u8) !void {
                 if (bmp_files == 0) {
                     std.debug.print("Bad clipper file: {s}\n", .{input_path});
                     ok = false;
+
                     continue;
                 }
 
@@ -1178,6 +1181,7 @@ fn convert(init: std.process.Init, args: []const [:0]const u8) !void {
                 if (tga_files == 0) {
                     std.debug.print("Bad texture file: {s}\n", .{input_path});
                     ok = false;
+
                     continue;
                 }
 
@@ -1192,6 +1196,7 @@ fn convert(init: std.process.Init, args: []const [:0]const u8) !void {
                     if (!kats_tools.kats_texture_get(file_content.ptr, file_content.len, tga_idx, &tga_data.ptr, &tga_data.len)) {
                         std.debug.print("TGA file {d} not found in {s}\n", .{ tga_idx, input_path });
                         ok = false;
+
                         continue;
                     }
 
@@ -1207,6 +1212,7 @@ fn convert(init: std.process.Init, args: []const [:0]const u8) !void {
                 if (wave_files == 0) {
                     std.debug.print("Bad sound file: {s}\n", .{input_path});
                     ok = false;
+
                     continue;
                 }
 
@@ -1221,6 +1227,7 @@ fn convert(init: std.process.Init, args: []const [:0]const u8) !void {
                     if (!kats_tools.kats_sound_get(file_content.ptr, file_content.len, wav_idx, &wav_data.ptr, &wav_data.len)) {
                         std.debug.print("WAV file {d} not found in {s}\n", .{ wav_idx, input_path });
                         ok = false;
+
                         continue;
                     }
 
