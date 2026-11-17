@@ -14,6 +14,7 @@ Groups a collection of animation channels together. It contains:
 
 - **Name**: A null-terminated string identifying the set.
 - **Channel Count**: The number of keyframe channels belonging to this set.
+- **Channel Names**: `Channel Count` tagged strings referencing Keyframe Channel records by their full names. Channels are not grouped by file adjacency.
 
 ### Keyframe Channel (`Type 8`)
 
@@ -24,7 +25,7 @@ Contains the actual animation data for a specific property of a specific node.
     - `tx`, `ty`, `tz`: Translation.
     - `rx`, `ry`, `rz`: Rotation (Euler angles in radians).
     - `sx`, `sy`, `sz`: Scale.
-- **Data**: A list of keyframe entries, where each entry is a pair of `(Time, Value)` (both 4-byte floats).
+- **Data**: A list of 12-byte keyframe entries. Each entry is `(Duration, Delta, Value)` (three 4-byte floats). `Duration` is in frames, `Delta` is the value change to the next key (wrapping to the first key for the last entry), and `Value` is the value at the key.
 
 ### Animation Reference (`Type 7`)
 
@@ -32,9 +33,9 @@ Used to link an animation set to a model.
 
 ## Animation Logic
 
-1.  **Targeting**: The animation engine matches a channel to a model node by parsing the `[NodeName]` from the channel's name.
-2.  **Interpolation**: The data is stored as discrete keyframes. The engine interpolates between these frames (typically linear interpolation for position/scale and spherical linear interpolation for rotations, though the raw data is Euler).
-3.  **Rotation**: Rotation is stored as Euler angles (`rx`, `ry`, `rz`) in radians.
+1.  **Targeting**: Remove the `[AnimSet]_` prefix and parse `[NodeName]_[ChannelType]` from the channel name.
+2.  **Interpolation**: Key times are cumulative durations. Values between keys are linearly interpolated using `Value + Delta * elapsed / Duration`; rotations are converted from Euler before quaternion interpolation.
+3.  **Rotation**: Rotation is stored as Euler angles (`rx`, `ry`, `rz`) in radians, composed as `Rz * Ry * Rx`. Unanimated components retain the node's bind transform.
 
 ## Encryption
 

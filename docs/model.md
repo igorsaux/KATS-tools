@@ -35,9 +35,9 @@ Defines the actual geometry.
 
 Defines how a mesh is shaded.
 
-- **Texture Link**: Contains the name of the associated texture.
-- **D3D8 Parameters**: Includes diffuse, ambient, specular, and emissive color components, plus a specular power value.
-- **Bone References**: A list of bone names associated with the material.
+- **Texture Link**: Contains the tagged name of the associated texture.
+- **Colors**: 32 bytes containing diffuse and ambient RGBA float vectors.
+- **Bone References**: A `u32` count followed by tagged bone names. Raw vertex bone indices are three times the index into this palette; divide by 3 before resolving the name.
 
 ### Shape Reference (`Type 2`)
 
@@ -56,7 +56,7 @@ Defines the scene hierarchy and skeleton.
 
 ### Skeleton Root (`Type 10`)
 
-Defines the root of a skeletal hierarchy.
+Defines the root of a skeletal hierarchy and contains a serialized node tree with transform, joint, and shape-reference nodes. Transform records also hold placement data used by scene objects.
 
 ## Encryption
 

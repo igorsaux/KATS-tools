@@ -926,17 +926,8 @@ const NameTagResult = struct {
     end_offset: usize,
 };
 
-/// Read a null-terminated string from a record data payload.
-/// Unlike readNameTagInPayload, this does NOT skip ASCII digit bytes after
-/// the null terminator. The "digit tag" convention is specific to the record
-/// header format (name + optional numeric tag). Within a record's data payload,
-/// strings are simply null-terminated and the byte immediately after the null
-/// belongs to the next field, not a tag.
-///
-/// Using readNameTagInPayload for data payloads was causing subtle offset bugs:
-/// if the byte after a name's null terminator happened to fall in 0x30..0x39
-/// (e.g. the LSB of a D3D material float like 0.7f -> [0x33,0x33,0x33,0x3F]),
-/// it would be consumed as a "digit tag", shifting all subsequent reads.
+/// Read a null-terminated string without a numeric tag from a simple payload
+/// such as SkeletonRoot or AnimRef.
 fn readNullTermInPayload(payload: [*]const u8, payload_len: usize, offset: usize) ?NameTagResult {
     if (offset >= payload_len) {
         return null;
@@ -961,13 +952,8 @@ fn readNullTermInPayload(payload: [*]const u8, payload_len: usize, offset: usize
 }
 
 /// Read a null-terminated string followed by an optional numeric tag (ASCII
-/// digit bytes) from a record HEADER. This is the original format where the
-/// record name is followed by an optional sequence of ASCII digits used as a
-/// disambiguation tag (e.g. "mesh\0" vs "mesh\01").
-///
-/// NOTE: Do NOT use this for reading strings from record DATA payloads.
-/// Use readNullTermInPayload instead, since data payload strings do not have
-/// digit tags and the next byte after null belongs to the following field.
+/// digit bytes). Tags occur in record headers and in nested string lists such
+/// as ShapeRef bindings, Material bone references, and AnimSet channel names.
 fn readNameTagInPayload(payload: [*]const u8, payload_len: usize, offset: usize) ?NameTagResult {
     if (offset >= payload_len) {
         return null;
@@ -1137,109 +1123,40 @@ pub const Material = extern struct {
 };
 
 pub export fn kats_model_get_material(record: *const Record, out: *Material) callconv(.c) bool {
-    if (record.ty != .material) {
-        return false;
-    }
-
-    if (record.data_len < 4) {
+    if (record.ty != .material or record.data_len < 4) {
         return false;
     }
 
     out.* = std.mem.zeroes(Material);
-
     out.sub_count = std.mem.readInt(u32, record.data[0..4], .little);
 
-    const nt = readNullTermInPayload(record.data, record.data_len, 4) orelse {
+    const nt = readNameTagInPayload(record.data, record.data_len, 4) orelse {
         out.texture_name = @ptrCast(@alignCast(&empty_string));
         out._bone_refs_offset = 4;
-
         return true;
     };
-
     out.texture_name = nt.name;
 
-    var pp: usize = nt.end_offset;
+    var offset = nt.end_offset;
 
-    if (pp + 68 <= record.data_len) {
+    if (offset + 32 <= record.data_len) {
         out.has_d3d_material = true;
-
-        for (0..4) |comp| {
-            out.diffuse[comp] = @bitCast(std.mem.readInt(u32, record.data[pp + comp * 4 .. pp + comp * 4 + 4][0..4], .little));
-            out.ambient[comp] = @bitCast(std.mem.readInt(u32, record.data[pp + 16 + comp * 4 .. pp + 16 + comp * 4 + 4][0..4], .little));
-            out.specular[comp] = @bitCast(std.mem.readInt(u32, record.data[pp + 32 + comp * 4 .. pp + 32 + comp * 4 + 4][0..4], .little));
-            out.emissive[comp] = @bitCast(std.mem.readInt(u32, record.data[pp + 48 + comp * 4 .. pp + 48 + comp * 4 + 4][0..4], .little));
+        for (0..4) |component| {
+            out.diffuse[component] = readF32Le(record.data + offset + component * 4);
+            out.ambient[component] = readF32Le(record.data + offset + 16 + component * 4);
         }
 
-        out.power = @bitCast(std.mem.readInt(u32, record.data[pp + 64 .. pp + 68][0..4], .little));
-        pp += 68;
+        offset += 32;
     }
 
-    out._bone_refs_offset = pp;
-    out._bone_refs_count = 0;
+    if (offset + 4 <= record.data_len) {
+        const bone_count = std.mem.readInt(u32, record.data[offset..][0..4], .little);
+        offset += 4;
 
-    // Try to locate the actual bone name strings.
-    // The data after the D3D material may contain a bone palette index array
-    // (sub_count * 4 bytes of u32) before the null-terminated bone names.
-    // We scan from the current offset looking for a region where we can read
-    // `sub_count` consecutive valid null-terminated ASCII strings.
-    if (out.sub_count > 0 and out.sub_count < 30) {
-        var best_offset: usize = pp;
-        var best_count: u32 = 0;
-
-        // Try offsets: current, current+4*sub_count, and a few other candidates
-        const candidates = [_]usize{
-            pp,
-            pp + @as(usize, out.sub_count) * 4,
-            pp + @as(usize, out.sub_count) * 2, // u16 indices
-            pp + 4, // single u32 count
-        };
-
-        for (candidates) |try_offset| {
-            if (try_offset >= record.data_len) continue;
-
-            var off: usize = try_offset;
-            var cnt: u32 = 0;
-
-            while (cnt < out.sub_count and cnt < 30) {
-                const br_nt = readNullTermInPayload(record.data, record.data_len, off) orelse {
-                    break;
-                };
-
-                // Validate: bone name should contain only printable ASCII
-                const name_slice = std.mem.span(br_nt.name);
-                var valid = true;
-
-                for (name_slice) |b| {
-                    if (b < 0x20 or b > 0x7e) {
-                        valid = false;
-
-                        break;
-                    }
-                }
-
-                // Empty names are technically valid (some bones may be unnamed)
-                // but if we see non-printable chars, this offset is wrong
-                if (!valid) {
-                    break;
-                }
-
-                cnt += 1;
-                off = br_nt.end_offset;
-            }
-
-            if (cnt > best_count) {
-                best_count = cnt;
-                best_offset = try_offset;
-            }
-
-            // If we got all sub_count strings, this is the right offset
-            if (cnt == out.sub_count) {
-                break;
-            }
+        if (bone_count < 1000) {
+            out._bone_refs_offset = offset;
+            out._bone_refs_count = bone_count;
         }
-
-        out._bone_refs_offset = best_offset;
-        out._bone_refs_count = best_count;
     }
 
     return true;
@@ -1248,68 +1165,23 @@ pub export fn kats_model_get_material(record: *const Record, out: *Material) cal
 const empty_string: [1]u8 = .{0};
 
 pub export fn kats_model_get_material_bone_ref_count(record: *const Record, material: *const Material) callconv(.c) usize {
-    // Use the pre-computed count from kats_model_get_material which already
-    // validated the bone names for printable ASCII.
-    if (material._bone_refs_count > 0) {
-        return material._bone_refs_count;
-    }
+    _ = record;
 
-    // Fallback: count valid null-terminated strings
-    var offset: usize = material._bone_refs_offset;
-    var count: usize = 0;
-
-    while (count < material.sub_count and count < 30) {
-        const nt = readNullTermInPayload(record.data, record.data_len, offset) orelse {
-            break;
-        };
-
-        // Validate: bone name should contain only printable ASCII
-        const name_slice = std.mem.span(nt.name);
-        var valid = true;
-
-        for (name_slice) |b| {
-            if (b < 0x20 or b > 0x7e) {
-                valid = false;
-
-                break;
-            }
-        }
-
-        if (!valid) {
-            break;
-        }
-
-        count += 1;
-        offset = nt.end_offset;
-    }
-
-    return count;
+    return material._bone_refs_count;
 }
 
 pub export fn kats_model_get_material_bone_ref(record: *const Record, material: *const Material, idx: usize, out_name: *[*:0]const u8) callconv(.c) bool {
-    var offset: usize = material._bone_refs_offset;
+    if (idx >= material._bone_refs_count) {
+        return false;
+    }
+
+    var offset = material._bone_refs_offset;
     var count: usize = 0;
 
-    while (count <= idx and count < material.sub_count and count < 30) {
-        const nt = readNullTermInPayload(record.data, record.data_len, offset) orelse {
+    while (count <= idx) : (count += 1) {
+        const nt = readNameTagInPayload(record.data, record.data_len, offset) orelse {
             return false;
         };
-
-        // Validate: bone name should contain only printable ASCII
-        const name_slice = std.mem.span(nt.name);
-        var valid = true;
-
-        for (name_slice) |b| {
-            if (b < 0x20 or b > 0x7e) {
-                valid = false;
-
-                break;
-            }
-        }
-
-        if (!valid) {
-            return false;
-        }
 
         if (count == idx) {
             out_name.* = nt.name;
@@ -1317,7 +1189,6 @@ pub export fn kats_model_get_material_bone_ref(record: *const Record, material: 
             return true;
         }
 
-        count += 1;
         offset = nt.end_offset;
     }
 
@@ -1361,11 +1232,11 @@ pub export fn kats_model_get_shape_ref_binding(record: *const Record, idx: usize
     var count: usize = 0;
 
     while (count <= idx) {
-        const mat_nt = readNullTermInPayload(record.data, record.data_len, offset) orelse {
+        const mat_nt = readNameTagInPayload(record.data, record.data_len, offset) orelse {
             return false;
         };
 
-        const shape_nt = readNullTermInPayload(record.data, record.data_len, mat_nt.end_offset) orelse {
+        const shape_nt = readNameTagInPayload(record.data, record.data_len, mat_nt.end_offset) orelse {
             return false;
         };
 
@@ -1598,7 +1469,7 @@ pub export fn kats_model_get_keyframe_channel(record: *const Record, out: *Keyfr
         return false;
     }
 
-    const kf_data_size: usize = @as(usize, out.kf_count) * 8;
+    const kf_data_size: usize = @as(usize, out.kf_count) * 12;
 
     if (8 + kf_data_size > record.data_len) {
         return false;
@@ -1625,6 +1496,37 @@ pub export fn kats_model_get_anim_set(record: *const Record, out: *AnimSet) call
     out.channel_count = std.mem.readInt(u32, record.data[0..4], .little);
 
     return true;
+}
+
+pub export fn kats_model_get_anim_set_channel(record: *const Record, idx: usize, out_name: *[*:0]const u8) callconv(.c) bool {
+    if (record.ty != .anim_set or record.data_len < 4) {
+        return false;
+    }
+
+    const count = std.mem.readInt(u32, record.data[0..4], .little);
+
+    if (idx >= count) {
+        return false;
+    }
+
+    var offset: usize = 4;
+    var current: usize = 0;
+
+    while (current <= idx) : (current += 1) {
+        const nt = readNameTagInPayload(record.data, record.data_len, offset) orelse {
+            return false;
+        };
+
+        if (current == idx) {
+            out_name.* = nt.name;
+
+            return true;
+        }
+
+        offset = nt.end_offset;
+    }
+
+    return false;
 }
 
 const JointParentRule = struct {

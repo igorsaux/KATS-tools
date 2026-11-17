@@ -93,6 +93,109 @@ const Binding = struct {
     shape_name: []const u8,
 };
 
+inline fn inverseBind(matrix: [12]f32) [12]f32 {
+    const a = [3][3]f32{
+        .{ matrix[0], matrix[1], matrix[2] },
+        .{ matrix[4], matrix[5], matrix[6] },
+        .{ matrix[8], matrix[9], matrix[10] },
+    };
+
+    const determinant = a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) -
+        a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
+        a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
+
+    const inverse = [3][3]f32{
+        .{ a[1][1] * a[2][2] - a[1][2] * a[2][1], a[0][2] * a[2][1] - a[0][1] * a[2][2], a[0][1] * a[1][2] - a[0][2] * a[1][1] },
+        .{ a[1][2] * a[2][0] - a[1][0] * a[2][2], a[0][0] * a[2][2] - a[0][2] * a[2][0], a[0][2] * a[1][0] - a[0][0] * a[1][2] },
+        .{ a[1][0] * a[2][1] - a[1][1] * a[2][0], a[0][1] * a[2][0] - a[0][0] * a[2][1], a[0][0] * a[1][1] - a[0][1] * a[1][0] },
+    };
+
+    var result: [12]f32 = undefined;
+
+    for (0..3) |row| {
+        for (0..3) |column| {
+            result[row * 4 + column] = inverse[row][column] / determinant;
+        }
+
+        result[row * 4 + 3] = -(inverse[row][0] * matrix[3] + inverse[row][1] * matrix[7] + inverse[row][2] * matrix[11]) / determinant;
+    }
+
+    return result;
+}
+
+inline fn transformPoint(matrix: [12]f32, point: [3]f32) [3]f32 {
+    var result: [3]f32 = undefined;
+
+    for (0..3) |row| {
+        result[row] = matrix[row * 4] * point[0] + matrix[row * 4 + 1] * point[1] + matrix[row * 4 + 2] * point[2] + matrix[row * 4 + 3];
+    }
+
+    return result;
+}
+
+fn inferJointParent(joint_records: []const kats_tools.Record, record: *const kats_tools.Record, out_parent: *?[*:0]const u8) bool {
+    const name = std.mem.span(record.name);
+
+    const auxiliary = [_]struct { name: []const u8, parent: [*:0]const u8 }{
+        .{ .name = "nenekoBone_nonDef", .parent = "capNenekoBone" },
+        .{ .name = "hairMomiL", .parent = "hairBone" },
+        .{ .name = "hairMomiR", .parent = "hairBone" },
+        .{ .name = "hairBackC", .parent = "hairBone" },
+        .{ .name = "hairBackLB", .parent = "hairBone" },
+        .{ .name = "hairBackRB", .parent = "hairBone" },
+        .{ .name = "hairBackLA", .parent = "hairBone" },
+        .{ .name = "hairBackRA", .parent = "hairBone" },
+        .{ .name = "hair_NonDeformation", .parent = "hairBone" },
+    };
+
+    for (auxiliary) |entry| {
+        if (std.mem.eql(u8, name, entry.name)) {
+            out_parent.* = entry.parent;
+
+            return true;
+        }
+    }
+
+    var current: kats_tools.Joint = undefined;
+
+    if (!kats_tools.kats_model_get_joint(record, &current)) {
+        return false;
+    }
+
+    const current_world = inverseBind(current.inv_bind_matrix_3x4);
+    const target = transformPoint(current_world, .{ 0, 0, 0 });
+
+    var best_error: f32 = std.math.inf(f32);
+    out_parent.* = null;
+
+    for (joint_records) |*candidate_record| {
+        if (candidate_record == record) {
+            continue;
+        }
+
+        var candidate: kats_tools.Joint = undefined;
+
+        if (!kats_tools.kats_model_get_joint(candidate_record, &candidate)) {
+            continue;
+        }
+
+        const actual = transformPoint(inverseBind(candidate.inv_bind_matrix_3x4), current.translation);
+        const delta = [3]f32{ actual[0] - target[0], actual[1] - target[1], actual[2] - target[2] };
+        const distance = @sqrt(delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]);
+
+        if (distance < best_error) {
+            best_error = distance;
+            out_parent.* = candidate_record.name;
+        }
+    }
+
+    if (best_error > 0.01) {
+        out_parent.* = null;
+    }
+
+    return true;
+}
+
 const MeshData = struct {
     record: kats_tools.Record,
     header: kats_tools.MeshShapeHeader,
@@ -714,15 +817,6 @@ fn convertModel(init: std.process.Init, file_content: []const u8, out_dir: []con
                     const tex_name = std.mem.span(material.texture_name);
                     try json_writer.writer.print("\"texture_name\": \"{s}\"", .{tex_name});
 
-                    // Debug: warn if bone_refs parsing seems incorrect
-                    {
-                        const bro = material._bone_refs_offset;
-                        const remaining = if (bro < mat_record.data_len) mat_record.data_len - bro else 0;
-                        if (material.sub_count > 0 and material._bone_refs_count == 0 and remaining > 0) {
-                            std.debug.print("WARNING: material '{s}' has sub_count={d} but found 0 valid bone refs (data_len={d}, offset={d}, remaining={d})\n", .{ mat_name, material.sub_count, mat_record.data_len, bro, remaining });
-                        }
-                    }
-
                     const bone_ref_count = kats_tools.kats_model_get_material_bone_ref_count(mat_record, &material);
 
                     if (bone_ref_count > 0) {
@@ -829,14 +923,6 @@ fn convertModel(init: std.process.Init, file_content: []const u8, out_dir: []con
             try json_writer.writer.print("      \"val1\": {d}, \"val2\": {d},\n", .{ skel_root.val1, skel_root.val2 });
             try json_writer.writer.print("      \"shape_ref\": \"{s}\",\n", .{std.mem.span(skel_root.skeleton_shape_ref)});
 
-            // Build joint name array for parent inference
-            var joint_names: std.ArrayList([*:0]const u8) = .empty;
-            defer joint_names.deinit(init.gpa);
-
-            for (sg.joint_records) |jr| {
-                try joint_names.append(init.gpa, jr.name);
-            }
-
             try json_writer.writer.writeAll("      \"joints\": [\n");
 
             for (sg.joint_records, 0..) |jr, jidx| {
@@ -856,7 +942,7 @@ fn convertModel(init: std.process.Init, file_content: []const u8, out_dir: []con
 
                 // Infer parent
                 var parent_name: ?[*:0]const u8 = null;
-                _ = kats_tools.kats_infer_joint_parent(jr.name, joint_names.items.ptr, joint_names.items.len, &parent_name);
+                _ = inferJointParent(joint_list.items, &jr, &parent_name);
 
                 try json_writer.writer.print("        {{\n", .{});
                 try json_writer.writer.print("          \"name\": \"{s}\",\n", .{jname});
@@ -934,9 +1020,6 @@ fn convertAnimation(init: std.process.Init, file_content: []const u8, out_dir: [
     try json_writer.writer.writeAll(sub_path);
     try json_writer.writer.writeAll("\",\n");
 
-    // Collect all AnimSets and their channels
-    // AnimSet groups channels that follow it until the next AnimSet or different record type
-
     const AnimGroup = struct {
         set_record: kats_tools.Record,
         channels: std.ArrayList(kats_tools.Record),
@@ -947,66 +1030,54 @@ fn convertAnimation(init: std.process.Init, file_content: []const u8, out_dir: [
         for (anim_groups.items) |*ag| {
             ag.channels.deinit(init.gpa);
         }
-
         anim_groups.deinit(init.gpa);
     }
 
     var anim_refs: std.ArrayList(kats_tools.Record) = .empty;
     defer anim_refs.deinit(init.gpa);
 
-    // Group channels by their preceding AnimSet
-    {
-        var current_set: ?kats_tools.Record = null;
-        var current_channels: std.ArrayList(kats_tools.Record) = .empty;
-        defer current_channels.deinit(init.gpa);
+    var channel_map: std.StringHashMapUnmanaged(kats_tools.Record) = .empty;
+    defer channel_map.deinit(init.gpa);
 
-        for (0..record_count) |rec_idx| {
-            var record: kats_tools.Record = undefined;
+    for (0..record_count) |rec_idx| {
+        var record: kats_tools.Record = undefined;
 
-            if (!kats_tools.kats_animation_get_record(file_content.ptr, file_content.len, rec_idx, &record)) {
-                continue;
-            }
+        if (!kats_tools.kats_animation_get_record(file_content.ptr, file_content.len, rec_idx, &record)) {
+            continue;
+        }
 
-            if (record.ty == .anim_set) {
-                // Flush previous group
-                if (current_set != null) {
-                    const cloned_channels = try current_channels.clone(init.gpa);
+        if (record.ty == .keyframe_channel) {
+            try channel_map.put(init.gpa, std.mem.span(record.name), record);
+        } else if (record.ty == .anim_ref) {
+            try anim_refs.append(init.gpa, record);
+        }
+    }
 
-                    try anim_groups.append(init.gpa, .{
-                        .set_record = current_set.?,
-                        .channels = cloned_channels,
-                    });
+    for (0..record_count) |rec_idx| {
+        var record: kats_tools.Record = undefined;
+
+        if (!kats_tools.kats_animation_get_record(file_content.ptr, file_content.len, rec_idx, &record) or record.ty != .anim_set) {
+            continue;
+        }
+
+        var group: AnimGroup = .{ .set_record = record, .channels = .empty };
+        var anim_set: kats_tools.AnimSet = undefined;
+
+        if (kats_tools.kats_model_get_anim_set(&record, &anim_set)) {
+            for (0..anim_set.channel_count) |channel_idx| {
+                var name: [*:0]const u8 = undefined;
+
+                if (!kats_tools.kats_model_get_anim_set_channel(&record, channel_idx, &name)) {
+                    break;
                 }
 
-                current_set = record;
-                current_channels.clearRetainingCapacity();
-            } else if (record.ty == .keyframe_channel) {
-                if (current_set != null) {
-                    try current_channels.append(init.gpa, record);
-                } else {
-                    // Orphan channel without a preceding AnimSet - create a synthetic group
-                    var synthetic_channels: std.ArrayList(kats_tools.Record) = .empty;
-                    try synthetic_channels.append(init.gpa, record);
-
-                    try anim_groups.append(init.gpa, .{
-                        .set_record = record, // use channel as its own "set"
-                        .channels = synthetic_channels,
-                    });
+                if (channel_map.get(std.mem.span(name))) |channel| {
+                    try group.channels.append(init.gpa, channel);
                 }
-            } else if (record.ty == .anim_ref) {
-                try anim_refs.append(init.gpa, record);
             }
         }
 
-        // Flush last group
-        if (current_set != null) {
-            const last_cloned = try current_channels.clone(init.gpa);
-
-            try anim_groups.append(init.gpa, .{
-                .set_record = current_set.?,
-                .channels = last_cloned,
-            });
-        }
+        try anim_groups.append(init.gpa, group);
     }
 
     // AnimRefs
@@ -1078,18 +1149,18 @@ fn convertAnimation(init: std.process.Init, file_content: []const u8, out_dir: [
             try json_writer.writer.print("          \"flag\": {d},\n", .{channel.flag});
             try json_writer.writer.print("          \"keyframe_count\": {d},\n", .{channel.kf_count});
 
-            // Keyframes: array of [time, value] pairs
             try json_writer.writer.writeAll("          \"keyframes\": [");
 
             for (0..channel.kf_count) |kf_idx| {
-                const time = channel.keyframes[kf_idx * 2];
-                const value = channel.keyframes[kf_idx * 2 + 1];
+                const duration = channel.keyframes[kf_idx * 3];
+                const delta = channel.keyframes[kf_idx * 3 + 1];
+                const value = channel.keyframes[kf_idx * 3 + 2];
 
                 if (kf_idx > 0) {
                     try json_writer.writer.writeAll(", ");
                 }
 
-                try json_writer.writer.print("[{d:.6}, {d:.6}]", .{ time, value });
+                try json_writer.writer.print("[{d:.6}, {d:.6}, {d:.6}]", .{ duration, delta, value });
             }
 
             try json_writer.writer.writeAll("]\n");

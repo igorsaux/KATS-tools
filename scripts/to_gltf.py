@@ -376,6 +376,7 @@ class ObjData:
     current_object: str | None = None
     current_material: str | None = None
     current_face_group: dict = field(default_factory=dict)
+    object_vertex_offsets: dict[str, int] = field(default_factory=dict)
 
 
 def parse_obj(obj_path: Path) -> ObjData:
@@ -419,6 +420,11 @@ def parse_obj(obj_path: Path) -> ObjData:
                         result.current_face_group[key].append(tri)
             elif cmd == "o":
                 result.current_object = parts[1] if len(parts) > 1 else None
+
+                if result.current_object is not None:
+                    result.object_vertex_offsets[result.current_object] = len(
+                        result.positions
+                    )
             elif cmd == "usemtl":
                 result.current_material = parts[1] if len(parts) > 1 else None
             elif cmd == "mtllib":
@@ -547,6 +553,20 @@ def mat3x4_to_mat4_col_major(m: list[float]) -> list[float]:
 # ---------------------------------------------------------------------------
 
 
+def normalize_keyframes(keyframes: list) -> list[list[float]]:
+    if not keyframes or len(keyframes[0]) == 2:
+        return keyframes
+
+    result = []
+    time = 0.0
+
+    for duration, _, value in keyframes:
+        result.append([time, value])
+        time += duration
+
+    return result
+
+
 def convert_to_gltf(model_dir: Path, anim_paths: list[Path], output_path: Path) -> None:
     """Convert KATS-tools output to glTF 2.0 binary."""
 
@@ -582,6 +602,7 @@ def convert_to_gltf(model_dir: Path, anim_paths: list[Path], output_path: Path) 
     skin_index: int | None = None
     skeleton_root_node: int | None = None
     joint_name_to_node: dict[str, int] = {}
+    joint_transform_defaults: dict[str, dict] = {}
 
     skeletons = model_json.get("skeletons", [])
     if skeletons:
@@ -611,6 +632,7 @@ def convert_to_gltf(model_dir: Path, anim_paths: list[Path], output_path: Path) 
                 )
                 joint_node_indices.append(node_idx)
                 joint_name_to_node[jname] = node_idx
+                joint_transform_defaults[jname] = jdata
 
                 # Inverse bind matrix
                 ibm = jdata.get("inv_bind_matrix_3x4")
@@ -642,14 +664,44 @@ def convert_to_gltf(model_dir: Path, anim_paths: list[Path], output_path: Path) 
             for jdata in joint_records:
                 jname = jdata["name"]
                 parent = jdata.get("parent")
+
+                if (
+                    parent
+                    and parent not in joint_name_to_node
+                    and parent in model_json.get("transforms", {})
+                ):
+                    transform = model_json["transforms"][parent]
+                    aux_node = builder.add_node(
+                        name=parent,
+                        translation=transform.get("translation", [0, 0, 0]),
+                        rotation=euler_to_quaternion(
+                            *transform.get("rotation", [0, 0, 0])
+                        ),
+                        scale=transform.get("scale", [1, 1, 1]),
+                    )
+                    joint_name_to_node[parent] = aux_node
+                    joint_transform_defaults[parent] = transform
+
                 if parent:
                     parent_node = joint_name_to_node.get(parent)
                     child_node = joint_name_to_node.get(jname)
+
                     if parent_node is not None and child_node is not None:
                         parent_node_data = builder.json_root["nodes"][parent_node]
+
                         if "children" not in parent_node_data:
                             parent_node_data["children"] = []
+
                         parent_node_data["children"].append(child_node)
+
+            for auxiliary_name in ("hairBone", "capNenekoBone"):
+                auxiliary_node = joint_name_to_node.get(auxiliary_name)
+                head_node = joint_name_to_node.get("head")
+
+                if auxiliary_node is not None and head_node is not None:
+                    builder.json_root["nodes"][head_node].setdefault(
+                        "children", []
+                    ).append(auxiliary_node)
 
             # Skeleton root node
             root_joint_name = joint_records[0]["name"]
@@ -783,30 +835,36 @@ def convert_to_gltf(model_dir: Path, anim_paths: list[Path], output_path: Path) 
                 joints_list: list[list[int]] = []
                 weights_list: list[list[float]] = []
 
-                for v_idx in range(n_verts):
-                    w = weights_flat[v_idx * 4 : v_idx * 4 + 4]
-                    bi = bone_indices_flat[v_idx * 4 : v_idx * 4 + 4]
+                object_vertex_offset = obj_data.object_vertex_offsets.get(obj_part, 0)
+                source_vertex_indices = [
+                    key[0] - 1 - object_vertex_offset for key in vertex_map
+                ]
+
+                for source_v_idx in source_vertex_indices:
+                    w = weights_flat[source_v_idx * 4 : source_v_idx * 4 + 4]
+                    bi = bone_indices_flat[source_v_idx * 4 : source_v_idx * 4 + 4]
                     # bone_indices are palette indices stored as float.
                     # Convert to int, then map via bone_refs if available.
                     raw_indices = [int(b) for b in bi]
+
                     if _bone_palette_to_joint:
                         mapped = []
+
                         for ri in raw_indices:
-                            # Try direct mapping first, then fall back to ri//3
-                            if ri in _bone_palette_to_joint:
-                                mapped.append(_bone_palette_to_joint[ri])
-                            elif ri // 3 in _bone_palette_to_joint:
-                                mapped.append(_bone_palette_to_joint[ri // 3])
-                            else:
-                                # Last resort: use the index directly as joint node
+                            palette_idx = ri // 3
+
+                            if palette_idx in _bone_palette_to_joint:
+                                mapped.append(_bone_palette_to_joint[palette_idx])
+                            elif joint_name_to_node:
                                 mapped.append(
-                                    min(ri, len(joint_name_to_node) - 1)
-                                    if joint_name_to_node
-                                    else 0
+                                    min(palette_idx, len(joint_name_to_node) - 1)
                                 )
+                            else:
+                                mapped.append(0)
                     else:
                         # Fallback: divide by 3 (D3D8 palette row / 3 heuristic)
                         mapped = [ri // 3 for ri in raw_indices]
+
                     joints_list.append(mapped)
                     weights_list.append(w)
 
@@ -829,6 +887,10 @@ def convert_to_gltf(model_dir: Path, anim_paths: list[Path], output_path: Path) 
         animations = anim_json.get("animations", {})
         for anim_name, anim_set in animations.items():
             channels_data = anim_set.get("channels", [])
+
+            for channel in channels_data:
+                channel["keyframes"] = normalize_keyframes(channel.get("keyframes", []))
+
             if not channels_data:
                 continue
 
@@ -918,25 +980,50 @@ def convert_to_gltf(model_dir: Path, anim_paths: list[Path], output_path: Path) 
                 if not sorted_times:
                     continue
 
-                # Interpolate values at each time point
+                target_joint_name = next(
+                    (
+                        name
+                        for name, idx in joint_name_to_node.items()
+                        if idx == target_node_idx
+                    ),
+                    None,
+                )
+                transform_defaults = joint_transform_defaults.get(target_joint_name, {})
+                path_defaults = {
+                    "translation": transform_defaults.get(
+                        "translation", [0.0, 0.0, 0.0]
+                    ),
+                    "rotation": transform_defaults.get("rotation", [0.0, 0.0, 0.0]),
+                    "scale": transform_defaults.get("scale", [1.0, 1.0, 1.0]),
+                }[gltf_path]
+
                 def interp_value(ct: str, t: float) -> float:
+                    component_idx = "xyz".index(ct[1])
                     kfs = comp_map.get(ct, [])
+
                     if not kfs:
-                        return 0.0
+                        return path_defaults[component_idx]
+
                     ch_kfs = next(
                         (c for c in sibling_channels if c.get("channel_type") == ct),
                         None,
                     )
+
                     if ch_kfs is None:
-                        return 0.0
+                        return path_defaults[component_idx]
+
                     ckf = ch_kfs.get("keyframes", [])
+
                     if not ckf:
                         return 0.0
+
                     # Simple linear interpolation
                     if t <= ckf[0][0]:
                         return ckf[0][1]
+
                     if t >= ckf[-1][0]:
                         return ckf[-1][1]
+
                     for i in range(len(ckf) - 1):
                         if ckf[i][0] <= t <= ckf[i + 1][0]:
                             frac = (
@@ -944,6 +1031,7 @@ def convert_to_gltf(model_dir: Path, anim_paths: list[Path], output_path: Path) 
                                 if ckf[i + 1][0] != ckf[i][0]
                                 else 0.0
                             )
+
                             return ckf[i][1] + frac * (ckf[i + 1][1] - ckf[i][1])
                     return ckf[-1][1]
 
